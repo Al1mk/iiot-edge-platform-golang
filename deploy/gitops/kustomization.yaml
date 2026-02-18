@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: iiot
+
+resources:
+  - ../k8s/collector-deployment.yaml
+  - ../k8s/ingestor-deployment.yaml
+
+commonLabels:
+  managed-by: kustomize
+  project: iiot-edge-platform

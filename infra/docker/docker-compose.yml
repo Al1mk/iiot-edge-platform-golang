@@ -1,0 +1,52 @@
+networks:
+  iiot-net:
+    driver: bridge
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: iiot-mosquitto
+    ports:
+      - "1883:1883"   # MQTT
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    networks:
+      - iiot-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "hc", "-W", "3"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  collector:
+    build:
+      context: ../..
+      dockerfile: edge/collector/Dockerfile
+    container_name: iiot-collector
+    environment:
+      MQTT_BROKER: "tcp://mosquitto:1883"
+      MQTT_CLIENT_ID: "collector-compose-1"
+      MQTT_TOPIC: "iiot/telemetry"
+      DEVICE_ID: "sensor-compose-001"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    ports:
+      - "9090:9090"   # Prometheus metrics
+    networks:
+      - iiot-net
+    restart: unless-stopped
+
+  ingestor:
+    build:
+      context: ../..
+      dockerfile: cloud/ingestor/Dockerfile
+    container_name: iiot-ingestor
+    ports:
+      - "8080:8080"   # HTTP API
+      - "9091:9091"   # Prometheus metrics
+    networks:
+      - iiot-net
+    restart: unless-stopped

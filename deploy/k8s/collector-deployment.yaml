@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iiot-collector
+  namespace: iiot
+  labels:
+    app: iiot-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iiot-collector
+  template:
+    metadata:
+      labels:
+        app: iiot-collector
+    spec:
+      containers:
+        - name: collector
+          image: iiot-collector:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MQTT_BROKER
+              value: "tcp://mosquitto:1883"
+            - name: MQTT_TOPIC
+              value: "iiot/telemetry"
+            - name: MQTT_CLIENT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name   # downward API: pod name as client ID
+            - name: DEVICE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name   # downward API: pod name as device ID
+          livenessProbe:
+            exec:
+              command: ["pgrep", "collector"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "64Mi"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
