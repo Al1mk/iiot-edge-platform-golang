@@ -50,3 +50,23 @@ services:
     networks:
       - iiot-net
     restart: unless-stopped
+
+  mqtt-bridge:
+    build:
+      context: ../..
+      dockerfile: cloud/mqtt-bridge/Dockerfile
+    container_name: iiot-mqtt-bridge
+    environment:
+      MQTT_BROKER: "tcp://mosquitto:1883"
+      MQTT_TOPIC: "iiot/telemetry"
+      INGESTOR_URL: "http://ingestor:8080/api/v1/telemetry"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      ingestor:
+        condition: service_started
+    ports:
+      - "9092:9092"   # Prometheus metrics
+    networks:
+      - iiot-net
+    restart: unless-stopped
