@@ -200,7 +200,14 @@ make k3d-load
 This runs `docker build` for all three Go services and imports the resulting images
 directly into the k3d containerd store via `k3d image import`. No registry is required.
 
-Run this command after every code change.
+**Tag convention:** `VERSION` defaults to `dev`, which matches the `newTag: dev` pins in
+`deploy/kustomize/overlays/local/kustomization.yaml`. The two are always in sync without
+any extra flags.
+
+For staging or production, create a dedicated overlay (e.g.
+`deploy/kustomize/overlays/staging/`) that pins the desired image tags. Any change to an
+overlay is a source-controlled file that must be committed — do not edit overlay files
+in-place without committing the result.
 
 ### 3. Deploy to the cluster
 
@@ -211,7 +218,13 @@ make k3d-deploy
 Validates manifests with `make manifests-lint`, applies `deploy/kustomize/overlays/local`,
 and waits for the collector, ingestor, and mqtt-bridge rollouts to complete (90 s timeout each).
 
-Alternatively, run all three steps at once (idempotent):
+**Iterative dev workflow** — after the cluster exists, skip cluster recreation:
+
+```bash
+make k3d-redeploy   # k3d-load + k3d-deploy, no cluster recreate
+```
+
+To run all three steps from scratch (idempotent):
 
 ```bash
 make k3d-up
@@ -266,29 +279,28 @@ curl -s -X POST http://localhost:8080/api/v1/telemetry \
 ### 6. Port-forward metrics ports
 
 Metrics services are ClusterIP-only and are not exposed via NodePort.
-Use `kubectl port-forward` to access them from the host:
+Use `kubectl port-forward` to access them from the host.
+
+The commands below use local ports `19090`/`19091`/`19092` to avoid conflicts
+with Docker Desktop and other local services that commonly occupy `9090`–`9092`:
 
 ```bash
-kubectl -n iiot port-forward svc/collector-metrics 9090:9090 &
-kubectl -n iiot port-forward svc/mqtt-bridge-metrics 9092:9092 &
-kubectl -n iiot port-forward svc/ingestor 9091:9091 &
+kubectl -n iiot port-forward svc/collector-metrics   19090:9090 &
+kubectl -n iiot port-forward svc/mqtt-bridge-metrics 19092:9092 &
+kubectl -n iiot port-forward svc/ingestor            19091:9091 &
 ```
 
-> **Note:** If port 9090 is already in use on the host (e.g. Docker Desktop on macOS),
-> use an alternate local port: `kubectl -n iiot port-forward svc/collector-metrics 19090:9090 &`
-> then query `http://localhost:19090/metrics`.
-
-Then run:
+Then verify each service is scraping:
 
 ```bash
-# Check collector is publishing
-curl -s http://localhost:9090/metrics | grep iiot_publish_success_total
+# Collector — should show a non-zero counter
+curl -s http://localhost:19090/metrics | grep iiot_publish_success_total
 
-# Check bridge is forwarding
-curl -s http://localhost:9092/metrics | grep bridge_forward_success_total
+# Bridge — should increase every ~5 s
+curl -s http://localhost:19092/metrics | grep bridge_forward_success_total
 
-# Check ingestor is receiving
-curl -s http://localhost:9091/metrics | grep iiot_http_requests_total
+# Ingestor — should show requests received
+curl -s http://localhost:19091/metrics | grep iiot_http_requests_total
 ```
 
 ### 7. Verify end-to-end telemetry flow
@@ -299,7 +311,15 @@ to the ingestor. Use port-forward (established in step 6) to poll metrics from t
 ```bash
 # bridge_forward_success_total should increase every ~5 s
 # (requires the port-forward from step 6 to be running)
-watch -n 5 "curl -s http://localhost:9092/metrics | grep bridge_forward_success_total"
+#
+# Option 1 — watch (GNU coreutils; not available on stock macOS):
+watch -n 5 "curl -s http://localhost:19092/metrics | grep bridge_forward_success_total"
+#
+# Option 2 — portable loop (works on macOS zsh and Linux):
+while true; do
+  curl -s http://localhost:19092/metrics | grep bridge_forward_success_total
+  sleep 5
+done
 
 # Ingestor logs should show 'received telemetry' entries
 kubectl -n iiot logs -f -l app.kubernetes.io/name=ingestor --prefix
