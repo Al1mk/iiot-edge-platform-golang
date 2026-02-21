@@ -109,8 +109,10 @@ stdout; storage forwarding is a TODO.
 
 ### Option B — Kubernetes (k3d / kind / production)
 
-Manifests live in `deploy/k8s/`. Apply the Kustomize overlay in `deploy/gitops/` to set
-the `iiot` namespace and common labels automatically.
+Manifests live in `deploy/kustomize/base/` (single source of truth). The local overlay
+at `deploy/kustomize/overlays/local/` adds dev image tags and a NodePort patch for k3d.
+The `deploy/gitops/kustomization.yaml` entry-point delegates to the local overlay and is
+the target for a FluxCD Kustomization CR.
 
 ---
 

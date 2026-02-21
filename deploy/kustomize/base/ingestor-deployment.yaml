@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestor
+  namespace: iiot
+  labels:
+    app.kubernetes.io/name: ingestor
+    app.kubernetes.io/part-of: iiot-edge-platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingestor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingestor
+        app.kubernetes.io/part-of: iiot-edge-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532   # distroless nonroot uid
+        runAsGroup: 65532
+      containers:
+        - name: ingestor
+          image: iiot-ingestor:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MAX_TS_SKEW
+              value: "24h"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          # Readiness: probe /healthz (app-specific endpoint) — pod only gets
+          # traffic once the HTTP server is fully up.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          # Liveness: also probe /healthz — restart if the server stops responding.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true

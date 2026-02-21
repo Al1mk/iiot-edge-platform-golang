@@ -1,0 +1,20 @@
+# Strategic merge patch: change ingestor Service to NodePort
+# and pin nodePort 30080, which k3d maps to localhost:8080
+# when the cluster is created with --port "8080:30080@loadbalancer".
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestor
+  namespace: iiot
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080
+      protocol: TCP
+    - name: metrics
+      port: 9091
+      targetPort: 9091
+      protocol: TCP

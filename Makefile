@@ -1,10 +1,26 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS  := -ldflags "-X main.version=$(VERSION)"
 
-COLLECTOR_BIN := bin/collector
-INGESTOR_BIN  := bin/ingestor
+COLLECTOR_BIN  := bin/collector
+INGESTOR_BIN   := bin/ingestor
+BRIDGE_BIN     := bin/mqtt-bridge
 
-.PHONY: fmt lint test build docker-build kind-up k3d-up compose-up compose-down clean help
+K3D_CLUSTER    := iiot
+# Single source of truth for all Kubernetes manifests.
+# Overlays layer on top; nothing else in this repo should reference raw YAML directly.
+KUSTOMIZE_BASE    := deploy/kustomize/base
+KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
+
+.PHONY: fmt lint test build \
+        docker-build \
+        manifests-lint \
+        k3d-cluster-up k3d-up k3d-down k3d-load k3d-deploy k3d-logs \
+        compose-up compose-down \
+        clean help
+
+# ---------------------------------------------------------------------------
+# Development
+# ---------------------------------------------------------------------------
 
 ## fmt: Format all Go source files
 fmt:
@@ -14,38 +30,97 @@ fmt:
 lint:
 	golangci-lint run ./...
 
-## test: Run all unit tests
+## test: Run all unit tests with race detector
 test:
 	go test ./... -v -race -timeout 60s
 
-## build: Compile collector and ingestor binaries to bin/
+## build: Compile all binaries to bin/
 build:
 	mkdir -p bin
 	CGO_ENABLED=0 go build $(LDFLAGS) -o $(COLLECTOR_BIN) ./edge/collector/...
 	CGO_ENABLED=0 go build $(LDFLAGS) -o $(INGESTOR_BIN)  ./cloud/ingestor/...
+	CGO_ENABLED=0 go build $(LDFLAGS) -o $(BRIDGE_BIN)    ./cloud/mqtt-bridge/...
 
-## docker-build: Build Docker images for collector and ingestor
+# ---------------------------------------------------------------------------
+# Kubernetes manifests
+# ---------------------------------------------------------------------------
+
+## manifests-lint: Validate kustomize builds render without errors (no cluster needed).
+##   Run this in CI to catch broken YAML or missing resources early.
+manifests-lint:
+	kubectl kustomize $(KUSTOMIZE_OVERLAY) > /dev/null
+	kubectl kustomize deploy/gitops         > /dev/null
+	@echo "kustomize build OK"
+
+# ---------------------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------------------
+
+## docker-build: Build all three Go service images tagged with VERSION
 docker-build:
-	docker build -f edge/collector/Dockerfile  -t iiot-collector:$(VERSION) .
-	docker build -f cloud/ingestor/Dockerfile  -t iiot-ingestor:$(VERSION)  .
+	docker build -f edge/collector/Dockerfile    -t iiot-collector:$(VERSION)   .
+	docker build -f cloud/ingestor/Dockerfile    -t iiot-ingestor:$(VERSION)    .
+	docker build -f cloud/mqtt-bridge/Dockerfile -t iiot-mqtt-bridge:$(VERSION) .
 
-## kind-up: Load images into a local kind cluster
-kind-up:
-	kind load docker-image iiot-collector:$(VERSION)
-	kind load docker-image iiot-ingestor:$(VERSION)
+# ---------------------------------------------------------------------------
+# Docker Compose
+# ---------------------------------------------------------------------------
 
-## k3d-up: Import images into a local k3d cluster
-k3d-up:
-	k3d image import iiot-collector:$(VERSION)
-	k3d image import iiot-ingestor:$(VERSION)
-
-## compose-up: Start the full stack with Docker Compose
+## compose-up: Build and start the full stack with Docker Compose
 compose-up:
 	docker compose -f infra/docker/docker-compose.yml up --build -d
 
 ## compose-down: Stop and remove all Compose services
 compose-down:
 	docker compose -f infra/docker/docker-compose.yml down
+
+# ---------------------------------------------------------------------------
+# k3d — local Kubernetes cluster
+# ---------------------------------------------------------------------------
+
+## k3d-cluster-up: Create the k3d cluster (skips if it already exists).
+##   Maps host :8080 → NodePort 30080 (ingestor HTTP API).
+##   Maps host :9090 → NodePort 30090 (collector metrics, optional).
+k3d-cluster-up:
+	@if k3d cluster list | grep -q "^$(K3D_CLUSTER) "; then \
+	  echo "k3d cluster '$(K3D_CLUSTER)' already exists — skipping create"; \
+	else \
+	  k3d cluster create $(K3D_CLUSTER) \
+	    --port "8080:30080@loadbalancer" \
+	    --port "9090:30090@loadbalancer" \
+	    --agents 1; \
+	fi
+
+## k3d-down: Delete the k3d cluster
+k3d-down:
+	k3d cluster delete $(K3D_CLUSTER)
+
+## k3d-load: Build images and import them into the k3d cluster.
+##   Uses the current VERSION tag. Run this after every code change.
+k3d-load: docker-build
+	k3d image import iiot-collector:$(VERSION)   -c $(K3D_CLUSTER)
+	k3d image import iiot-ingestor:$(VERSION)    -c $(K3D_CLUSTER)
+	k3d image import iiot-mqtt-bridge:$(VERSION) -c $(K3D_CLUSTER)
+
+## k3d-deploy: Validate manifests, then apply the kustomize local overlay
+k3d-deploy: manifests-lint
+	kubectl apply -k $(KUSTOMIZE_OVERLAY)
+	kubectl -n iiot rollout status deployment/collector   --timeout=90s
+	kubectl -n iiot rollout status deployment/ingestor    --timeout=90s
+	kubectl -n iiot rollout status deployment/mqtt-bridge --timeout=90s
+
+## k3d-up: Full workflow — create cluster, load images, deploy (idempotent)
+k3d-up: k3d-cluster-up k3d-load k3d-deploy
+
+## k3d-logs: Tail logs from all iiot pods (Ctrl-C to exit)
+k3d-logs:
+	kubectl -n iiot logs -f --prefix \
+	  -l app.kubernetes.io/part-of=iiot-edge-platform \
+	  --max-log-requests 10
+
+# ---------------------------------------------------------------------------
+# Housekeeping
+# ---------------------------------------------------------------------------
 
 ## clean: Remove build artifacts
 clean:

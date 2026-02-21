@@ -1,12 +1,14 @@
+# GitOps entry-point kustomization.
+#
+# This file is the target for a FluxCD Kustomization CR.
+# It delegates to the kustomize/overlays/local overlay so that both
+# `kubectl apply -k deploy/gitops/` and a Flux Kustomization pointing at this
+# path produce identical results.
+#
+# For a production GitOps setup, create a separate overlay
+# (e.g. deploy/kustomize/overlays/prod) and point your Flux CR there.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: iiot
-
 resources:
-  - ../k8s/collector-deployment.yaml
-  - ../k8s/ingestor-deployment.yaml
-
-commonLabels:
-  managed-by: kustomize
-  project: iiot-edge-platform
+  - ../kustomize/overlays/local

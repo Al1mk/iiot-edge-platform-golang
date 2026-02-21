@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mosquitto
+  namespace: iiot
+  labels:
+    app.kubernetes.io/name: mosquitto
+    app.kubernetes.io/part-of: iiot-edge-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mosquitto
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mosquitto
+        app.kubernetes.io/part-of: iiot-edge-platform
+    spec:
+      # mosquitto official image runs as root by default; override to uid 1883
+      # which is the conventional mosquitto uid in most distros.
+      securityContext:
+        runAsUser: 1883
+        runAsGroup: 1883
+        fsGroup: 1883
+      containers:
+        - name: mosquitto
+          image: eclipse-mosquitto:2.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: mqtt
+              containerPort: 1883
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /mosquitto/config/mosquitto.conf
+              subPath: mosquitto.conf
+              readOnly: true
+            # emptyDir for /mosquitto/data — dev only; no persistence.
+            # Replace with a PVC for production.
+            - name: data
+              mountPath: /mosquitto/data
+            # emptyDir for log dir; mosquitto may write here even with log_dest stdout.
+            - name: log
+              mountPath: /mosquitto/log
+          readinessProbe:
+            tcpSocket:
+              port: 1883
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 1883
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            # mosquitto writes to /mosquitto/data and /mosquitto/log (both emptyDir),
+            # so readOnlyRootFilesystem cannot be true here.
+            readOnlyRootFilesystem: false
+      volumes:
+        - name: config
+          configMap:
+            name: mosquitto-config
+        - name: data
+          emptyDir: {}
+        - name: log
+          emptyDir: {}

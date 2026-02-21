@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Local overlay: targets a k3d cluster with images loaded via `k3d image import`.
+# Images use the `dev` tag built locally; imagePullPolicy is IfNotPresent.
+
+namespace: iiot
+
+resources:
+  - ../../base
+
+# Pin image tags explicitly so kustomize can patch them.
+# Update newTag when you rebuild: make k3d-load VERSION=<tag>
+images:
+  - name: iiot-collector
+    newTag: dev
+  - name: iiot-ingestor
+    newTag: dev
+  - name: iiot-mqtt-bridge
+    newTag: dev
+
+patches:
+  # Patch ingestor Service to NodePort so the API is reachable from the host
+  # via the k3d load-balancer without a separate port-forward.
+  - path: ingestor-nodeport-patch.yaml
+    target:
+      kind: Service
+      name: ingestor

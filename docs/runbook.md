@@ -8,8 +8,9 @@
 | Docker | 24.x | https://docs.docker.com/get-docker/ |
 | Docker Compose | v2.x (plugin) | bundled with Docker Desktop |
 | make | any | OS package manager |
-| k3d *(Option B only)* | 5.x | `brew install k3d` |
-| kubectl *(Option B only)* | 1.29+ | `brew install kubectl` |
+| k3d | 5.x | `brew install k3d` |
+| kubectl | 1.29+ | `brew install kubectl` |
+| kustomize | 5.x | bundled with kubectl 1.29+ (`kubectl kustomize`) |
 
 > **Go version:** The project uses `go 1.23` in `go.mod` and relies on Go 1.22+
 > method-qualified ServeMux patterns (`"GET /path"`). Go 1.22 is the minimum.
@@ -59,9 +60,9 @@ go mod tidy
 make compose-up
 ```
 
-This builds the collector and ingestor images, starts Mosquitto, and wires everything
-together on the `iiot-net` bridge network. The collector waits for Mosquitto to pass its
-healthcheck before connecting.
+This builds all four images (collector, ingestor, mqtt-bridge, mosquitto), and wires
+everything together on the `iiot-net` bridge network. The collector and mqtt-bridge wait
+for Mosquitto to pass its healthcheck before connecting.
 
 ### 3. Verify health
 
@@ -73,6 +74,7 @@ curl http://localhost:8080/healthz
 # Container health status (should show "healthy" after ~30 s)
 docker inspect --format '{{.State.Health.Status}}' iiot-collector
 docker inspect --format '{{.State.Health.Status}}' iiot-ingestor
+docker inspect --format '{{.State.Health.Status}}' iiot-mqtt-bridge
 ```
 
 ### 4. Watch live MQTT messages from the host
@@ -115,6 +117,9 @@ curl http://localhost:9091/metrics | grep iiot_http_requests_total
 
 # Collector metrics
 curl http://localhost:9090/metrics | grep iiot_publish
+
+# Bridge metrics
+curl http://localhost:9092/metrics | grep bridge_
 ```
 
 ### 7. Tail logs
@@ -122,6 +127,7 @@ curl http://localhost:9090/metrics | grep iiot_publish
 ```bash
 docker logs -f iiot-ingestor
 docker logs -f iiot-collector
+docker logs -f iiot-mqtt-bridge
 ```
 
 ### 8. Stop
@@ -134,38 +140,188 @@ make compose-down
 
 ## Option B — k3d (local Kubernetes)
 
-### 1. Create a cluster
+This section describes the full end-to-end local Kubernetes workflow using k3d.
+All four components (mosquitto, collector, mqtt-bridge, ingestor) are deployed
+into the `iiot` namespace via kustomize.
 
-```bash
-k3d cluster create iiot --port "8080:30080@loadbalancer"
+### Manifest layout
+
+`deploy/kustomize/base/` is the **single source of truth** for all Kubernetes YAML.
+Overlays layer on top of it; nothing else in the repo duplicates these manifests.
+
+```
+deploy/
+├── kustomize/
+│   ├── base/                   # Canonical manifests — one file per resource
+│   │   ├── namespace.yaml
+│   │   ├── mosquitto-configmap.yaml
+│   │   ├── mosquitto-deployment.yaml
+│   │   ├── mosquitto-service.yaml
+│   │   ├── collector-deployment.yaml
+│   │   ├── collector-service.yaml
+│   │   ├── mqtt-bridge-deployment.yaml
+│   │   ├── mqtt-bridge-service.yaml
+│   │   ├── ingestor-deployment.yaml
+│   │   ├── ingestor-service.yaml
+│   │   └── kustomization.yaml
+│   └── overlays/local/         # k3d-specific: dev image tags + NodePort patch
+│       ├── ingestor-nodeport-patch.yaml
+│       └── kustomization.yaml
+└── gitops/
+    └── kustomization.yaml      # FluxCD entry-point (delegates to overlays/local)
 ```
 
-### 2. Build and import images
+To validate manifests render correctly without a cluster:
 
 ```bash
-make docker-build
+make manifests-lint
+```
+
+### 1. Create the k3d cluster
+
+```bash
+make k3d-cluster-up
+```
+
+This creates a cluster named `iiot` with:
+- Host port `8080` → NodePort `30080` (ingestor HTTP API, reachable at `http://localhost:8080`)
+- Host port `9090` → NodePort `30090` (optional: collector metrics)
+- 1 agent node
+
+Skip if the cluster already exists — the target is idempotent.
+
+### 2. Build images and load them into k3d
+
+```bash
+make k3d-load
+```
+
+This runs `docker build` for all three Go services and imports the resulting images
+directly into the k3d containerd store via `k3d image import`. No registry is required.
+
+Run this command after every code change.
+
+### 3. Deploy to the cluster
+
+```bash
+make k3d-deploy
+```
+
+Validates manifests with `make manifests-lint`, applies `deploy/kustomize/overlays/local`,
+and waits for the collector, ingestor, and mqtt-bridge rollouts to complete (90 s timeout each).
+
+Alternatively, run all three steps at once (idempotent):
+
+```bash
 make k3d-up
 ```
 
-### 3. Create the namespace and apply manifests
+### 4. Verify pods and services are running
+
+Run these commands to confirm the cluster state:
 
 ```bash
-kubectl create namespace iiot
-kubectl apply -k deploy/gitops/
+kubectl -n iiot get pods,svc
 ```
 
-### 4. Check rollout
+Expected output (all pods `Running`, `1/1` or `2/2` ready):
 
-```bash
-kubectl -n iiot rollout status deployment/iiot-ingestor
-kubectl -n iiot get pods
+```
+NAME                              READY   STATUS    RESTARTS   AGE
+pod/collector-xxx                 1/1     Running   0          60s
+pod/ingestor-xxx                  1/1     Running   0          60s
+pod/ingestor-yyy                  1/1     Running   0          60s
+pod/mqtt-bridge-xxx               1/1     Running   0          60s
+pod/mosquitto-xxx                 1/1     Running   0          60s
+
+NAME                      TYPE        CLUSTER-IP    PORT(S)
+svc/collector-metrics     ClusterIP   10.x.x.x      9090/TCP
+svc/ingestor              NodePort    10.x.x.x      8080:30080/TCP, 9091/TCP
+svc/mqtt-bridge-metrics   ClusterIP   10.x.x.x      9092/TCP
+svc/mosquitto             ClusterIP   10.x.x.x      1883/TCP
 ```
 
-### 5. Port-forward and test
+### 5. Verify ingestor HTTP API (via NodePort)
+
+The ingestor is exposed on host port 8080 via the k3d load-balancer:
 
 ```bash
-kubectl -n iiot port-forward svc/iiot-ingestor 8080:80 &
 curl http://localhost:8080/healthz
+# → {"status":"ok"}
+
+curl -s -X POST http://localhost:8080/api/v1/telemetry \
+  -H "Content-Type: application/json" \
+  -d '{
+    "device_id":     "k8s-test-001",
+    "timestamp":     "2026-02-18T10:00:00Z",
+    "temperature_c": 22.5,
+    "pressure_hpa":  1012.0,
+    "humidity_pct":  55.0,
+    "status":        "ok"
+  }'
+# → {"result":"accepted"}
+```
+
+### 6. Port-forward metrics ports
+
+Metrics services are ClusterIP-only (not exposed via NodePort). Use port-forward
+to access them from the host:
+
+```bash
+# Ingestor metrics (terminal 1)
+kubectl -n iiot port-forward svc/ingestor 9091:9091 &
+
+# Collector metrics (terminal 2)
+kubectl -n iiot port-forward svc/collector-metrics 9090:9090 &
+
+# Bridge metrics (terminal 3)
+kubectl -n iiot port-forward svc/mqtt-bridge-metrics 9092:9092 &
+```
+
+Then run:
+
+```bash
+# Check collector is publishing
+curl -s http://localhost:9090/metrics | grep iiot_publish_success_total
+
+# Check bridge is forwarding
+curl -s http://localhost:9092/metrics | grep bridge_forward_success_total
+
+# Check ingestor is receiving
+curl -s http://localhost:9091/metrics | grep iiot_http_requests_total
+```
+
+### 7. Verify end-to-end telemetry flow
+
+The collector publishes to Mosquitto every 5 s. The bridge subscribes and forwards
+to the ingestor. Use port-forward (established in step 6) to poll metrics from the host:
+
+```bash
+# bridge_forward_success_total should increase every ~5 s
+# (requires the port-forward from step 6 to be running)
+watch -n 5 "curl -s http://localhost:9092/metrics | grep bridge_forward_success_total"
+
+# Ingestor logs should show 'received telemetry' entries
+kubectl -n iiot logs -f -l app.kubernetes.io/name=ingestor --prefix
+```
+
+> **Note on exec probes:** Kubernetes `exec` probes do not require a shell — they run
+> the command array directly via the container runtime, the same way Docker's exec-form
+> `HEALTHCHECK CMD ["/app/binary", "-healthcheck"]` works. The Go service containers use
+> HTTP probes (`GET /metrics` and `GET /healthz`) as a straightforward health signal that
+> avoids coupling the probe implementation to the binary's `-healthcheck` flag. Either
+> approach is valid; HTTP probes are used here for simplicity.
+
+### 8. Tail all logs at once
+
+```bash
+make k3d-logs
+```
+
+### 9. Tear down the cluster
+
+```bash
+make k3d-down
 ```
 
 ---
@@ -175,7 +331,7 @@ curl http://localhost:8080/healthz
 Requires Go 1.22+.
 
 ```bash
-# Builds bin/collector and bin/ingestor
+# Builds bin/collector, bin/ingestor, and bin/mqtt-bridge
 make build
 
 # Run ingestor (terminal 1)
@@ -184,9 +340,15 @@ make build
 # Run collector (terminal 2) — needs a local MQTT broker
 MQTT_BROKER=tcp://localhost:1883 ./bin/collector
 
+# Run mqtt-bridge (terminal 3) — needs mosquitto and ingestor
+MQTT_BROKER=tcp://localhost:1883 \
+INGESTOR_URL=http://localhost:8080/api/v1/telemetry \
+./bin/mqtt-bridge
+
 # Healthcheck probes (exit 0 = healthy)
-./bin/ingestor  -healthcheck
-./bin/collector -healthcheck
+./bin/ingestor    -healthcheck
+./bin/collector   -healthcheck
+./bin/mqtt-bridge -healthcheck
 ```
 
 ---
@@ -210,14 +372,65 @@ MQTT_BROKER=tcp://localhost:1883 ./bin/collector
 |----------|---------|-------------|
 | `MAX_TS_SKEW` | `24h` | Maximum allowed timestamp skew relative to server time |
 
+### MQTT Bridge
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MQTT_BROKER` | `tcp://mosquitto:1883` | MQTT broker URL |
+| `MQTT_TOPIC` | `iiot/telemetry` | Topic to subscribe to |
+| `INGESTOR_URL` | `http://ingestor:8080/api/v1/telemetry` | Ingestor POST endpoint |
+| `METRICS_ADDR` | `:9092` | Address for the Prometheus metrics server |
+| `BRIDGE_WORKERS` | `16` | Number of parallel forwarding workers |
+| `BRIDGE_QUEUE_SIZE` | `1000` | Buffered channel depth |
+| `SHUTDOWN_TIMEOUT` | `10s` | Max time to drain queue on SIGTERM |
+
+---
+
+## GitOps (FluxCD) — optional
+
+The `deploy/gitops/kustomization.yaml` file is a thin wrapper that delegates
+to `deploy/kustomize/overlays/local`. It is the intended target for a FluxCD
+`Kustomization` custom resource.
+
+### Bootstrap guide (docs only — Flux is not required to run the stack)
+
+1. Install Flux CLI:
+
+```bash
+brew install fluxcd/tap/flux
+```
+
+2. Bootstrap Flux into your cluster, pointing at your Git repository:
+
+```bash
+flux bootstrap github \
+  --owner=<your-github-org> \
+  --repository=iiot-edge-platform \
+  --branch=main \
+  --path=deploy/gitops \
+  --personal
+```
+
+3. Flux will reconcile `deploy/gitops/kustomization.yaml` on every push to `main`.
+   The kustomization delegates to `deploy/kustomize/overlays/local`, so the same
+   manifests used locally are applied by Flux.
+
+4. To promote to a production overlay, create `deploy/kustomize/overlays/prod/`,
+   update `deploy/gitops/kustomization.yaml` to point there, and add image update
+   automation for production image tags.
+
+> **Note:** For production use, replace the `dev` image tags with immutable digest
+> references (`image@sha256:...`) and store sensitive config in Kubernetes Secrets
+> or an external secrets manager (e.g. External Secrets Operator).
+
 ---
 
 ## Troubleshooting
 
 ### Collector exits: `initial MQTT connect failed`
 
-- Mosquitto is not running — start with `make compose-up` or `brew services start mosquitto`.
-- `MQTT_BROKER` is wrong — default is `tcp://localhost:1883`.
+- Mosquitto is not running — run `make compose-up` or check the mosquitto pod: `kubectl -n iiot logs -l app.kubernetes.io/name=mosquitto`.
+- `MQTT_BROKER` is wrong — in k8s it must be `tcp://mosquitto.iiot.svc.cluster.local:1883`.
 - Port 1883 is firewalled — check firewall rules.
 
 ### Ingestor returns 422 on valid-looking payload
@@ -226,19 +439,32 @@ MQTT_BROKER=tcp://localhost:1883 ./bin/collector
 - Check `MAX_TS_SKEW` — if your timestamp is stale beyond the limit, the request is rejected.
 - Ensure `status` field is not empty.
 
-### `docker inspect` shows `unhealthy`
+### Pods stuck in `Pending`
 
-- Wait for `start_period` (15 s) to elapse before declaring unhealthy.
-- Check logs: `docker logs iiot-collector` / `docker logs iiot-ingestor`.
-- Ensure the metrics port (9090 collector, 8080 ingestor) is listening inside the container.
+- Run `kubectl -n iiot describe pod <pod-name>` and look for `Events`.
+- Common causes: image not loaded into k3d (`make k3d-load`), resource limits exceeded.
+
+### `ImagePullBackOff` in k3d
+
+```bash
+# Confirm the image exists locally
+docker images | grep iiot
+
+# Reload into k3d
+make k3d-load
+```
+
+`imagePullPolicy: IfNotPresent` is set on all Go service containers. As long as
+`k3d image import` succeeds, the image will be used from the containerd store.
 
 ### k3d image import fails
 
 ```bash
-docker images | grep iiot   # verify image exists
+docker images | grep iiot   # verify image was built
 make docker-build            # rebuild if missing
-k3d image import iiot-collector:dev -c iiot
-k3d image import iiot-ingestor:dev  -c iiot
+k3d image import iiot-collector:dev   -c iiot
+k3d image import iiot-ingestor:dev    -c iiot
+k3d image import iiot-mqtt-bridge:dev -c iiot
 ```
 
 ### go.sum out of date
@@ -254,9 +480,10 @@ lsof -i :8080        # find the process
 kill -9 <PID>
 ```
 
-Or remap the host port in `infra/docker/docker-compose.yml`:
+Or create the k3d cluster on a different host port:
 
-```yaml
-ports:
-  - "9080:8080"
+```bash
+k3d cluster create iiot --port "9080:30080@loadbalancer"
 ```
+
+Then access the ingestor at `http://localhost:9080`.
