@@ -185,8 +185,9 @@ make k3d-cluster-up
 
 This creates a cluster named `iiot` with:
 - Host port `8080` → NodePort `30080` (ingestor HTTP API, reachable at `http://localhost:8080`)
-- Host port `9090` → NodePort `30090` (optional: collector metrics)
 - 1 agent node
+
+Metrics ports are **not** mapped via NodePort. Access them with `kubectl port-forward` (see step 6).
 
 Skip if the cluster already exists — the target is idempotent.
 
@@ -264,19 +265,18 @@ curl -s -X POST http://localhost:8080/api/v1/telemetry \
 
 ### 6. Port-forward metrics ports
 
-Metrics services are ClusterIP-only (not exposed via NodePort). Use port-forward
-to access them from the host:
+Metrics services are ClusterIP-only and are not exposed via NodePort.
+Use `kubectl port-forward` to access them from the host:
 
 ```bash
-# Ingestor metrics (terminal 1)
-kubectl -n iiot port-forward svc/ingestor 9091:9091 &
-
-# Collector metrics (terminal 2)
 kubectl -n iiot port-forward svc/collector-metrics 9090:9090 &
-
-# Bridge metrics (terminal 3)
 kubectl -n iiot port-forward svc/mqtt-bridge-metrics 9092:9092 &
+kubectl -n iiot port-forward svc/ingestor 9091:9091 &
 ```
+
+> **Note:** If port 9090 is already in use on the host (e.g. Docker Desktop on macOS),
+> use an alternate local port: `kubectl -n iiot port-forward svc/collector-metrics 19090:9090 &`
+> then query `http://localhost:19090/metrics`.
 
 Then run:
 

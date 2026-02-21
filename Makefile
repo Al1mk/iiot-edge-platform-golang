@@ -80,14 +80,13 @@ compose-down:
 
 ## k3d-cluster-up: Create the k3d cluster (skips if it already exists).
 ##   Maps host :8080 → NodePort 30080 (ingestor HTTP API).
-##   Maps host :9090 → NodePort 30090 (collector metrics, optional).
+##   Metrics ports are NOT exposed via NodePort; use kubectl port-forward instead.
 k3d-cluster-up:
 	@if k3d cluster list | grep -q "^$(K3D_CLUSTER) "; then \
 	  echo "k3d cluster '$(K3D_CLUSTER)' already exists — skipping create"; \
 	else \
 	  k3d cluster create $(K3D_CLUSTER) \
 	    --port "8080:30080@loadbalancer" \
-	    --port "9090:30090@loadbalancer" \
 	    --agents 1; \
 	fi
 
