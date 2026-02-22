@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,6 +37,26 @@ var (
 		Help:    "HTTP request latency in seconds by method and route.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"method", "route"})
+
+	// lastTelemetryTimestamp is set to the unix-second timestamp of the last
+	// successfully accepted telemetry reading. It is 0 until the first reading
+	// arrives; Prometheus will emit the metric at 0 in that case.
+	lastTelemetryTimestamp = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "iiot_last_telemetry_timestamp_seconds",
+		Help: "Unix timestamp (seconds) of the last successfully accepted telemetry reading. 0 if none received yet.",
+	})
+)
+
+// lastEntry holds the most-recently accepted telemetry reading and the wall
+// clock time it was stored. Protected by lastMu.
+type lastEntry struct {
+	ReceivedAt int64                  `json:"received_at"` // unix seconds
+	Payload    models.TelemetryReading `json:"payload"`
+}
+
+var (
+	lastMu    sync.RWMutex
+	lastStore *lastEntry // nil until first successful POST
 )
 
 func getEnv(key, defaultVal string) string {
@@ -113,8 +134,29 @@ func makeTelemetryHandler(maxSkew time.Duration) http.HandlerFunc {
 
 		// TODO: Forward to Kafka topic or write to TimescaleDB / InfluxDB.
 
+		// Store last accepted reading and update the Prometheus gauge.
+		now := time.Now().Unix()
+		lastMu.Lock()
+		lastStore = &lastEntry{ReceivedAt: now, Payload: reading}
+		lastMu.Unlock()
+		lastTelemetryTimestamp.Set(float64(now))
+
 		writeJSON(w, http.StatusAccepted, map[string]string{"result": "accepted"})
 	}
+}
+
+// lastTelemetryHandler serves GET /api/v1/telemetry/last.
+// Returns 404 if no telemetry has been received since startup; otherwise 200.
+func lastTelemetryHandler(w http.ResponseWriter, _ *http.Request) {
+	lastMu.RLock()
+	entry := lastStore
+	lastMu.RUnlock()
+
+	if entry == nil {
+		writeError(w, http.StatusNotFound, "no_telemetry", "no telemetry received")
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
 }
 
 // routeLabel returns a stable Prometheus label for the request path,
@@ -125,6 +167,8 @@ func routeLabel(r *http.Request) string {
 		return "/healthz"
 	case "/api/v1/telemetry":
 		return "/api/v1/telemetry"
+	case "/api/v1/telemetry/last":
+		return "/api/v1/telemetry/last"
 	default:
 		return "other"
 	}
@@ -207,6 +251,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler)
 	mux.HandleFunc("POST /api/v1/telemetry", makeTelemetryHandler(maxSkew))
+	mux.HandleFunc("GET /api/v1/telemetry/last", lastTelemetryHandler)
 
 	srv := &http.Server{
 		Addr:         addr,

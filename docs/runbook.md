@@ -337,13 +337,31 @@ kubectl -n iiot logs -f -l app.kubernetes.io/name=ingestor --prefix
 > avoids coupling the probe implementation to the binary's `-healthcheck` flag. Either
 > approach is valid; HTTP probes are used here for simplicity.
 
-### 8. Tail all logs at once
+### 8. E2E verification
+
+Run the full end-to-end check in one command:
+
+```bash
+make k3d-e2e
+```
+
+This target:
+1. Runs `make k3d-up` (idempotent — skips cluster/image steps if already done)
+2. Starts metrics port-forwards via `make k3d-metrics`
+3. POSTs a known telemetry payload to `/api/v1/telemetry` and asserts HTTP 202
+4. GETs `/api/v1/telemetry/last` and asserts the device ID is present
+5. Reads `iiot_last_telemetry_timestamp_seconds` from ingestor metrics and asserts it is > 0
+6. Always runs `make k3d-metrics-down` on exit (via shell trap), even if a step fails
+
+On success it prints `E2E OK`.
+
+### 9. Tail all logs at once
 
 ```bash
 make k3d-logs
 ```
 
-### 9. Tear down the cluster
+### 10. Tear down the cluster
 
 ```bash
 make k3d-down

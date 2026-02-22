@@ -20,7 +20,7 @@ KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
         manifests-lint \
         k3d-guard-docker k3d-guard-kube \
         k3d-cluster-up k3d-up k3d-down k3d-load k3d-deploy k3d-redeploy k3d-logs \
-        k3d-metrics k3d-metrics-down k3d-smoke \
+        k3d-metrics k3d-metrics-down k3d-smoke k3d-e2e \
         compose-up compose-down \
         clean help
 
@@ -248,6 +248,52 @@ k3d-smoke: k3d-guard-docker k3d-guard-kube
 	}; \
 	echo "  iiot_http_requests_total OK"
 	@echo "SMOKE OK"
+
+## k3d-e2e: Full end-to-end verification: deploy, POST telemetry, GET last, check gauge.
+##   Starts metrics port-forwards automatically and always stops them on exit (trap).
+k3d-e2e: k3d-guard-docker k3d-guard-kube
+	@echo "--- e2e: ensure cluster and services are up ---"
+	@$(MAKE) k3d-up
+	@echo "--- e2e: start metrics port-forwards ---"
+	@$(MAKE) k3d-metrics
+	@echo "--- e2e: running checks (metrics-down runs on exit) ---"
+	@trap '$(MAKE) k3d-metrics-down' EXIT; \
+	set -e; \
+	\
+	echo "--- e2e: POST telemetry ---"; \
+	now=$$(date -u +"%Y-%m-%dT%H:%M:%SZ"); \
+	payload="{\"device_id\":\"e2e-test\",\"timestamp\":\"$${now}\",\"temperature_c\":21.5,\"pressure_hpa\":1013.0,\"humidity_pct\":50.0,\"status\":\"ok\"}"; \
+	http_code=$$(curl -s -o /tmp/e2e-post.out -w "%{http_code}" \
+	  -X POST http://localhost:8080/api/v1/telemetry \
+	  -H "Content-Type: application/json" \
+	  -d "$$payload"); \
+	echo "  POST /api/v1/telemetry → HTTP $${http_code}  body: $$(cat /tmp/e2e-post.out)"; \
+	[ "$$http_code" = "202" ] || { echo "FAIL: expected 202, got $${http_code}"; exit 1; }; \
+	echo "  POST OK"; \
+	\
+	echo "--- e2e: GET /api/v1/telemetry/last ---"; \
+	found=0; i=0; \
+	while [ "$$i" -lt 20 ]; do \
+	  i=$$((i+1)); \
+	  http_code=$$(curl -s -o /tmp/e2e-last.out -w "%{http_code}" \
+	    http://localhost:8080/api/v1/telemetry/last); \
+	  body=$$(cat /tmp/e2e-last.out); \
+	  [ "$$http_code" = "200" ] || continue; \
+	  echo "$$body" | grep -q '"e2e-test"' && { found=1; break; }; \
+	done; \
+	echo "  GET /api/v1/telemetry/last → HTTP $${http_code}  body: $${body}"; \
+	[ "$$found" = "1" ] || { echo "FAIL: device_id e2e-test not found in GET /api/v1/telemetry/last after 20 attempts"; exit 1; }; \
+	echo "$$body" | grep -q '"received_at"' || { echo "FAIL: received_at not found in response"; exit 1; }; \
+	echo "  GET last OK"; \
+	\
+	echo "--- e2e: gauge iiot_last_telemetry_timestamp_seconds ---"; \
+	gauge=$$(curl -s http://localhost:19091/metrics | grep "^iiot_last_telemetry_timestamp_seconds " | awk '{print $$2}'); \
+	echo "  iiot_last_telemetry_timestamp_seconds = $${gauge}"; \
+	[ -n "$$gauge" ] && [ "$$(echo "$$gauge > 0" | awk '{print ($$1 > 0) ? 1 : 0}')" = "1" ] \
+	  || { echo "FAIL: gauge is missing or zero"; exit 1; }; \
+	echo "  gauge OK"; \
+	\
+	echo "E2E OK"
 
 ## k3d-logs: Tail logs from all iiot pods (Ctrl-C to exit)
 k3d-logs:
