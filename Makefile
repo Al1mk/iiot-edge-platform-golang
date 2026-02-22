@@ -20,7 +20,7 @@ KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
         manifests-lint \
         k3d-guard-docker k3d-guard-kube \
         k3d-cluster-up k3d-up k3d-down k3d-load k3d-deploy k3d-redeploy k3d-logs \
-        k3d-metrics k3d-metrics-down k3d-smoke k3d-e2e k3d-e2e-db \
+        k3d-metrics k3d-metrics-down k3d-smoke k3d-e2e k3d-e2e-db k3d-e2e-db-persist \
         compose-up compose-down \
         clean help
 
@@ -349,6 +349,81 @@ k3d-e2e-db: k3d-guard-docker k3d-guard-kube
 	echo "  iiot_db_up OK"; \
 	\
 	echo "E2E-DB OK"
+
+## k3d-e2e-db-persist: Verify SQLite PVC persistence: POST telemetry, restart deployment, confirm data survives.
+##   Requires the cluster to be up (make k3d-up).
+k3d-e2e-db-persist: k3d-guard-docker k3d-guard-kube
+	@set -e; \
+	_wait_healthz() { \
+	  _tries=0; \
+	  while [ "$$_tries" -lt 60 ]; do \
+	    _out=$$(curl -sS --max-time 1 http://localhost:8080/healthz 2>&1) || true; \
+	    case "$$_out" in \
+	      *'"status":"ok"'*) echo "  healthz OK (try $$(( _tries + 1 )))"; return 0 ;; \
+	    esac; \
+	    _tries=$$(( _tries + 1 )); \
+	    [ "$$(( _tries % 10 ))" = "0" ] && echo "  waiting for healthz... (try $${_tries}/60)"; \
+	    sleep 0.2; \
+	  done; \
+	  echo "FAIL: healthz did not return ok after 60 tries"; \
+	  kubectl -n iiot get pods -l app.kubernetes.io/name=ingestor -o wide; \
+	  kubectl -n iiot get endpointslice -l kubernetes.io/service-name=ingestor -o wide || true; \
+	  kubectl -n iiot logs -l app.kubernetes.io/name=ingestor --tail=80 --prefix || true; \
+	  exit 1; \
+	}; \
+	\
+	echo "--- e2e-db-persist: seed ClientIP affinity ---"; \
+	_wait_healthz; \
+	\
+	echo "--- e2e-db-persist: POST telemetry ---"; \
+	now=$$(date -u +"%Y-%m-%dT%H:%M:%SZ"); \
+	payload="{\"device_id\":\"e2e-db-persist\",\"timestamp\":\"$${now}\",\"temperature_c\":20.0,\"pressure_hpa\":1014.0,\"humidity_pct\":58.0,\"status\":\"ok\"}"; \
+	http_code=$$(curl -s -o /tmp/e2e-db-persist-post.out -w "%{http_code}" \
+	  -X POST http://localhost:8080/api/v1/telemetry \
+	  -H "Content-Type: application/json" \
+	  -d "$$payload"); \
+	echo "  POST /api/v1/telemetry → HTTP $${http_code}  body: $$(cat /tmp/e2e-db-persist-post.out)"; \
+	[ "$$http_code" = "202" ] || { echo "FAIL: expected 202, got $${http_code}"; exit 1; }; \
+	echo "  POST OK"; \
+	\
+	echo "--- e2e-db-persist: GET /last before restart ---"; \
+	http_code=$$(curl -s -o /tmp/e2e-db-persist-last1.out -w "%{http_code}" \
+	  "http://localhost:8080/api/v1/telemetry/last?device_id=e2e-db-persist"); \
+	body=$$(cat /tmp/e2e-db-persist-last1.out); \
+	echo "  GET /last → HTTP $${http_code}  body: $${body}"; \
+	[ "$$http_code" = "200" ] || { echo "FAIL: expected 200, got $${http_code}"; exit 1; }; \
+	echo "$$body" | grep -q '"received_at_unix"' || { echo "FAIL: received_at_unix not found"; exit 1; }; \
+	received_at=$$(echo "$$body" | sed 's/.*"received_at_unix":\([0-9]*\).*/\1/'); \
+	echo "  received_at_unix before restart: $${received_at}"; \
+	\
+	echo "--- e2e-db-persist: GET /recent before restart ---"; \
+	http_code=$$(curl -s -o /tmp/e2e-db-persist-recent.out -w "%{http_code}" \
+	  "http://localhost:8080/api/v1/telemetry/recent?device_id=e2e-db-persist&limit=1"); \
+	body=$$(cat /tmp/e2e-db-persist-recent.out); \
+	echo "  GET /recent → HTTP $${http_code}  body: $${body}"; \
+	[ "$$http_code" = "200" ] || { echo "FAIL: expected 200, got $${http_code}"; exit 1; }; \
+	echo "$$body" | grep -q '"e2e-db-persist"' || { echo "FAIL: device_id e2e-db-persist not in recent"; exit 1; }; \
+	echo "  GET recent OK"; \
+	\
+	echo "--- e2e-db-persist: rollout restart ---"; \
+	kubectl -n iiot rollout restart deployment/ingestor; \
+	kubectl -n iiot rollout status deployment/ingestor --timeout=90s; \
+	\
+	echo "--- e2e-db-persist: re-seed ClientIP affinity ---"; \
+	_wait_healthz; \
+	\
+	echo "--- e2e-db-persist: GET /last after restart ---"; \
+	http_code=$$(curl -s -o /tmp/e2e-db-persist-last2.out -w "%{http_code}" \
+	  "http://localhost:8080/api/v1/telemetry/last?device_id=e2e-db-persist"); \
+	body=$$(cat /tmp/e2e-db-persist-last2.out); \
+	echo "  GET /last → HTTP $${http_code}  body: $${body}"; \
+	[ "$$http_code" = "200" ] || { echo "FAIL: expected 200 after restart, got $${http_code}"; exit 1; }; \
+	received_at2=$$(echo "$$body" | sed 's/.*"received_at_unix":\([0-9]*\).*/\1/'); \
+	echo "  received_at_unix after restart:  $${received_at2}"; \
+	[ "$$received_at" = "$$received_at2" ] || { echo "FAIL: received_at_unix changed: $${received_at} → $${received_at2}"; exit 1; }; \
+	echo "  data survived restart — received_at_unix matches"; \
+	\
+	echo "E2E-DB-PERSIST OK"
 
 ## k3d-logs: Tail logs from all iiot pods (Ctrl-C to exit)
 k3d-logs:
