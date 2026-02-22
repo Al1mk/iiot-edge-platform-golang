@@ -1,4 +1,8 @@
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+# Local dev default. CI/release builds override this:
+#   make k3d-load VERSION=v1.2.3
+# The kustomize local overlay always pins newTag: dev, so the local workflow
+# requires VERSION=dev (the default). Override only when cutting a release.
+VERSION ?= dev
 LDFLAGS  := -ldflags "-X main.version=$(VERSION)"
 
 COLLECTOR_BIN  := bin/collector
@@ -14,7 +18,8 @@ KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
 .PHONY: fmt lint test build \
         docker-build \
         manifests-lint \
-        k3d-cluster-up k3d-up k3d-down k3d-load k3d-deploy k3d-logs \
+        k3d-cluster-up k3d-up k3d-down k3d-load k3d-deploy k3d-redeploy k3d-logs \
+        k3d-metrics k3d-metrics-down \
         compose-up compose-down \
         clean help
 
@@ -110,6 +115,32 @@ k3d-deploy: manifests-lint
 
 ## k3d-up: Full workflow — create cluster, load images, deploy (idempotent)
 k3d-up: k3d-cluster-up k3d-load k3d-deploy
+
+## k3d-redeploy: Rebuild images and redeploy without recreating the cluster.
+##   Use this for iterative code changes after the cluster already exists.
+k3d-redeploy: k3d-load k3d-deploy
+
+## k3d-metrics: Start port-forwards for all three metrics endpoints.
+##   Logs written to /tmp/pf-{collector,bridge,ingestor}.log
+##   Ports: collector=19090, ingestor=19091, bridge=19092
+k3d-metrics:
+	@kubectl -n iiot port-forward svc/collector-metrics   19090:9090 >/tmp/pf-collector.log 2>&1 &
+	@kubectl -n iiot port-forward svc/mqtt-bridge-metrics 19092:9092 >/tmp/pf-bridge.log   2>&1 &
+	@kubectl -n iiot port-forward svc/ingestor            19091:9091 >/tmp/pf-ingestor.log 2>&1 &
+	@echo "Port-forwards started."
+	@echo "  collector  → http://localhost:19090/metrics  (log: /tmp/pf-collector.log)"
+	@echo "  ingestor   → http://localhost:19091/metrics  (log: /tmp/pf-ingestor.log)"
+	@echo "  bridge     → http://localhost:19092/metrics  (log: /tmp/pf-bridge.log)"
+
+## k3d-metrics-down: Stop the port-forwards started by k3d-metrics.
+k3d-metrics-down:
+	@pkill -f "kubectl -n iiot port-forward svc/collector-metrics 19090:9090"   || true
+	@pkill -f "kubectl -n iiot port-forward svc/mqtt-bridge-metrics 19092:9092" || true
+	@pkill -f "kubectl -n iiot port-forward svc/ingestor 19091:9091"            || true
+	@echo "Port-forwards stopped. Remaining listeners on 19090/19091/19092:"
+	@lsof -nP -iTCP:19090 -sTCP:LISTEN 2>/dev/null || true
+	@lsof -nP -iTCP:19091 -sTCP:LISTEN 2>/dev/null || true
+	@lsof -nP -iTCP:19092 -sTCP:LISTEN 2>/dev/null || true
 
 ## k3d-logs: Tail logs from all iiot pods (Ctrl-C to exit)
 k3d-logs:

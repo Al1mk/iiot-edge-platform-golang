@@ -279,16 +279,30 @@ curl -s -X POST http://localhost:8080/api/v1/telemetry \
 ### 6. Port-forward metrics ports
 
 Metrics services are ClusterIP-only and are not exposed via NodePort.
-Use `kubectl port-forward` to access them from the host.
-
-The commands below use local ports `19090`/`19091`/`19092` to avoid conflicts
-with Docker Desktop and other local services that commonly occupy `9090`–`9092`:
+Use the Makefile helper to start all three port-forwards in one command:
 
 ```bash
-kubectl -n iiot port-forward svc/collector-metrics   19090:9090 &
-kubectl -n iiot port-forward svc/mqtt-bridge-metrics 19092:9092 &
-kubectl -n iiot port-forward svc/ingestor            19091:9091 &
+make k3d-metrics
 ```
+
+This forwards to conflict-free local ports (`19090`/`19091`/`19092`) and writes each
+tunnel's output to a log file under `/tmp/`:
+
+| Service | Local URL | Log |
+|---------|-----------|-----|
+| collector | `http://localhost:19090/metrics` | `/tmp/pf-collector.log` |
+| ingestor | `http://localhost:19091/metrics` | `/tmp/pf-ingestor.log` |
+| bridge | `http://localhost:19092/metrics` | `/tmp/pf-bridge.log` |
+
+To stop all three tunnels:
+
+```bash
+make k3d-metrics-down
+```
+
+> **macOS note:** `lsof` output from `make k3d-metrics-down` may show `com.docke`
+> as the process holding a port. This is Docker Desktop's userspace proxy and is normal —
+> it does not mean the port-forward failed.
 
 Then verify each service is scraping:
 
