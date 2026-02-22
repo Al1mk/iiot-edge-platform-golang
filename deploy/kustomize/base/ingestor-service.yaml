@@ -8,6 +8,10 @@ metadata:
     app.kubernetes.io/part-of: iiot-edge-platform
 spec:
   type: ClusterIP
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
   selector:
     app.kubernetes.io/name: ingestor
   ports:

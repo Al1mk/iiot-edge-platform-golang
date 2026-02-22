@@ -260,6 +260,9 @@ k3d-e2e: k3d-guard-docker k3d-guard-kube
 	@trap '$(MAKE) k3d-metrics-down' EXIT; \
 	set -e; \
 	\
+	echo "--- e2e: seed ClientIP affinity ---"; \
+	curl -s http://localhost:8080/healthz >/dev/null; \
+	\
 	echo "--- e2e: POST telemetry ---"; \
 	now=$$(date -u +"%Y-%m-%dT%H:%M:%SZ"); \
 	payload="{\"device_id\":\"e2e-test\",\"timestamp\":\"$${now}\",\"temperature_c\":21.5,\"pressure_hpa\":1013.0,\"humidity_pct\":50.0,\"status\":\"ok\"}"; \
@@ -272,17 +275,17 @@ k3d-e2e: k3d-guard-docker k3d-guard-kube
 	echo "  POST OK"; \
 	\
 	echo "--- e2e: GET /api/v1/telemetry/last ---"; \
-	found=0; i=0; \
-	while [ "$$i" -lt 20 ]; do \
-	  i=$$((i+1)); \
+	found=0; \
+	for _retry in 1 2 3; do \
 	  http_code=$$(curl -s -o /tmp/e2e-last.out -w "%{http_code}" \
 	    http://localhost:8080/api/v1/telemetry/last); \
 	  body=$$(cat /tmp/e2e-last.out); \
-	  [ "$$http_code" = "200" ] || continue; \
-	  echo "$$body" | grep -q '"e2e-test"' && { found=1; break; }; \
+	  [ "$$http_code" = "200" ] && echo "$$body" | grep -q '"e2e-test"' \
+	    && { found=1; break; }; \
+	  sleep 0.2; \
 	done; \
 	echo "  GET /api/v1/telemetry/last → HTTP $${http_code}  body: $${body}"; \
-	[ "$$found" = "1" ] || { echo "FAIL: device_id e2e-test not found in GET /api/v1/telemetry/last after 20 attempts"; exit 1; }; \
+	[ "$$found" = "1" ] || { echo "FAIL: device_id e2e-test not found in GET /api/v1/telemetry/last"; exit 1; }; \
 	echo "$$body" | grep -q '"received_at"' || { echo "FAIL: received_at not found in response"; exit 1; }; \
 	echo "  GET last OK"; \
 	\

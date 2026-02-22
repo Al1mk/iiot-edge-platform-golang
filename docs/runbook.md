@@ -355,6 +355,11 @@ This target:
 
 On success it prints `E2E OK`.
 
+> **Session affinity:** the ingestor `Service` sets `sessionAffinity: ClientIP` (3-hour timeout).
+> This pins all requests from the same source IP to the same replica, so a POST followed
+> immediately by a GET `/last` always hits the same in-memory store. The e2e target seeds
+> affinity with a `GET /healthz` before the POST to ensure the pin is established.
+
 ### 9. Tail all logs at once
 
 ```bash
