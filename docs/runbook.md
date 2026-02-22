@@ -276,59 +276,50 @@ curl -s -X POST http://localhost:8080/api/v1/telemetry \
 # → {"result":"accepted"}
 ```
 
-### 6. Port-forward metrics ports
+### 6. Port-forward metrics ports and run smoke checks
 
-Metrics services are ClusterIP-only and are not exposed via NodePort.
-Use the Makefile helper to start all three port-forwards in one command:
-
-```bash
-make k3d-metrics
-```
-
-This forwards to conflict-free local ports (`19090`/`19091`/`19092`) and writes each
-tunnel's output to a log file under `/tmp/`:
-
-| Service | Local URL | Log |
-|---------|-----------|-----|
-| collector | `http://localhost:19090/metrics` | `/tmp/pf-collector.log` |
-| ingestor | `http://localhost:19091/metrics` | `/tmp/pf-ingestor.log` |
-| bridge | `http://localhost:19092/metrics` | `/tmp/pf-bridge.log` |
-
-To stop all three tunnels:
+The recommended workflow runs all validation in three commands:
 
 ```bash
+make k3d-metrics   # start port-forwards (idempotent — safe to re-run)
+make k3d-smoke     # healthz + all three metrics checks
 make k3d-metrics-down
 ```
 
-> **macOS note:** `lsof` output from `make k3d-metrics-down` may show `com.docke`
-> as the process holding a port. This is Docker Desktop's userspace proxy and is normal —
-> it does not mean the port-forward failed.
+`make k3d-metrics` forwards to conflict-free local ports and writes each tunnel's
+output to a PID-tracked log file under `/tmp/`:
 
-Then verify each service is scraping:
+| Service | Local URL | PID file | Log |
+|---------|-----------|----------|-----|
+| collector | `http://localhost:19090/metrics` | `/tmp/pf-collector.pid` | `/tmp/pf-collector.log` |
+| ingestor | `http://localhost:19091/metrics` | `/tmp/pf-ingestor.pid` | `/tmp/pf-ingestor.log` |
+| bridge | `http://localhost:19092/metrics` | `/tmp/pf-bridge.pid` | `/tmp/pf-bridge.log` |
 
-```bash
-# Collector — should show a non-zero counter
-curl -s http://localhost:19090/metrics | grep iiot_publish_success_total
+Both `make k3d-metrics` and `make k3d-smoke` are idempotent: if a port-forward is already
+running (PID file present and process alive) it will not start a duplicate.
 
-# Bridge — should increase every ~5 s
-curl -s http://localhost:19092/metrics | grep bridge_forward_success_total
+`make k3d-smoke` checks:
 
-# Ingestor — should show requests received
-curl -s http://localhost:19091/metrics | grep iiot_http_requests_total
-```
+1. `GET /healthz` returns `{"status":"ok"}`
+2. `iiot_publish_success_total` present in collector metrics
+3. `bridge_forward_success_total` present in bridge metrics
+4. `iiot_http_requests_total` present in ingestor metrics
+
+If any check fails it prints which one failed and exits non-zero. On success it prints `SMOKE OK`.
+
+> **macOS note:** after `make k3d-metrics-down`, `lsof` may show `com.docke` holding a port.
+> This is Docker Desktop's userspace proxy and is normal — it does not mean a port-forward is
+> still running.
 
 ### 7. Verify end-to-end telemetry flow
 
 The collector publishes to Mosquitto every 5 s. The bridge subscribes and forwards
-to the ingestor. Use port-forward (established in step 6) to poll metrics from the host:
+to the ingestor. Poll the bridge counter to confirm the full pipeline is flowing:
 
 ```bash
-# bridge_forward_success_total should increase every ~5 s
-# (requires the port-forward from step 6 to be running)
-#
 # Option 1 — watch (GNU coreutils; not available on stock macOS):
 watch -n 5 "curl -s http://localhost:19092/metrics | grep bridge_forward_success_total"
-#
+
 # Option 2 — portable loop (works on macOS zsh and Linux):
 while true; do
   curl -s http://localhost:19092/metrics | grep bridge_forward_success_total

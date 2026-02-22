@@ -18,8 +18,9 @@ KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
 .PHONY: fmt lint test build \
         docker-build \
         manifests-lint \
+        k3d-guard-docker k3d-guard-kube \
         k3d-cluster-up k3d-up k3d-down k3d-load k3d-deploy k3d-redeploy k3d-logs \
-        k3d-metrics k3d-metrics-down \
+        k3d-metrics k3d-metrics-down k3d-smoke \
         compose-up compose-down \
         clean help
 
@@ -80,6 +81,33 @@ compose-down:
 	docker compose -f infra/docker/docker-compose.yml down
 
 # ---------------------------------------------------------------------------
+# k3d — guards
+# ---------------------------------------------------------------------------
+
+## k3d-guard-docker: Fail fast if Docker daemon is not reachable.
+k3d-guard-docker:
+	@docker info >/dev/null 2>&1 || { \
+	  echo "Docker is not running. Start Docker Desktop and retry."; \
+	  exit 1; \
+	}
+
+## k3d-guard-kube: Fail fast if kubectl cannot reach the k3d cluster.
+k3d-guard-kube:
+	@ctx=$$(kubectl config current-context 2>/dev/null) || ctx=""; \
+	case "$$ctx" in \
+	  k3d-$(K3D_CLUSTER)*) ;; \
+	  *) echo "Kubernetes context is not ready for k3d cluster '$(K3D_CLUSTER)'. Run: make k3d-up"; exit 1 ;; \
+	esac
+	@kubectl cluster-info >/dev/null 2>&1 || { \
+	  echo "Kubernetes context is not ready for k3d cluster '$(K3D_CLUSTER)'. Run: make k3d-up"; \
+	  exit 1; \
+	}
+	@kubectl get nodes >/dev/null 2>&1 || { \
+	  echo "Kubernetes context is not ready for k3d cluster '$(K3D_CLUSTER)'. Run: make k3d-up"; \
+	  exit 1; \
+	}
+
+# ---------------------------------------------------------------------------
 # k3d — local Kubernetes cluster
 # ---------------------------------------------------------------------------
 
@@ -120,27 +148,106 @@ k3d-up: k3d-cluster-up k3d-load k3d-deploy
 ##   Use this for iterative code changes after the cluster already exists.
 k3d-redeploy: k3d-load k3d-deploy
 
-## k3d-metrics: Start port-forwards for all three metrics endpoints.
-##   Logs written to /tmp/pf-{collector,bridge,ingestor}.log
-##   Ports: collector=19090, ingestor=19091, bridge=19092
-k3d-metrics:
-	@kubectl -n iiot port-forward svc/collector-metrics   19090:9090 >/tmp/pf-collector.log 2>&1 &
-	@kubectl -n iiot port-forward svc/mqtt-bridge-metrics 19092:9092 >/tmp/pf-bridge.log   2>&1 &
-	@kubectl -n iiot port-forward svc/ingestor            19091:9091 >/tmp/pf-ingestor.log 2>&1 &
-	@echo "Port-forwards started."
-	@echo "  collector  → http://localhost:19090/metrics  (log: /tmp/pf-collector.log)"
-	@echo "  ingestor   → http://localhost:19091/metrics  (log: /tmp/pf-ingestor.log)"
-	@echo "  bridge     → http://localhost:19092/metrics  (log: /tmp/pf-bridge.log)"
+## k3d-metrics: Start port-forwards for all three metrics endpoints (idempotent via PID files).
+##   PID files: /tmp/pf-{collector,ingestor,bridge}.pid
+##   Logs:      /tmp/pf-{collector,ingestor,bridge}.log
+##   Ports:     collector=19090, ingestor=19091, bridge=19092
+k3d-metrics: k3d-guard-docker k3d-guard-kube
+	@_pf_start() { \
+	  name=$$1; svc=$$2; local_port=$$3; remote_port=$$4; \
+	  pidfile="/tmp/pf-$${name}.pid"; \
+	  logfile="/tmp/pf-$${name}.log"; \
+	  if [ -f "$$pidfile" ]; then \
+	    pid=$$(cat "$$pidfile"); \
+	    if kill -0 "$$pid" 2>/dev/null; then \
+	      echo "  $$name port-forward already running (pid $$pid)"; \
+	      return 0; \
+	    fi; \
+	    rm -f "$$pidfile"; \
+	  fi; \
+	  kubectl -n iiot port-forward "$$svc" "$${local_port}:$${remote_port}" \
+	    >"$$logfile" 2>&1 & \
+	  echo $$! >"$$pidfile"; \
+	  echo "  $$name → http://localhost:$${local_port}/metrics  (pid $$(cat $$pidfile), log: $$logfile)"; \
+	}; \
+	_pf_start collector  svc/collector-metrics   19090 9090; \
+	_pf_start ingestor   svc/ingestor            19091 9091; \
+	_pf_start bridge     svc/mqtt-bridge-metrics 19092 9092; \
+	echo "Port-forwards started."
 
-## k3d-metrics-down: Stop the port-forwards started by k3d-metrics.
+## k3d-metrics-down: Stop port-forwards started by k3d-metrics (PID-file aware, idempotent).
 k3d-metrics-down:
-	@pkill -f "kubectl -n iiot port-forward svc/collector-metrics 19090:9090"   || true
-	@pkill -f "kubectl -n iiot port-forward svc/mqtt-bridge-metrics 19092:9092" || true
-	@pkill -f "kubectl -n iiot port-forward svc/ingestor 19091:9091"            || true
-	@echo "Port-forwards stopped. Remaining listeners on 19090/19091/19092:"
-	@lsof -nP -iTCP:19090 -sTCP:LISTEN 2>/dev/null || true
-	@lsof -nP -iTCP:19091 -sTCP:LISTEN 2>/dev/null || true
-	@lsof -nP -iTCP:19092 -sTCP:LISTEN 2>/dev/null || true
+	@_pf_stop() { \
+	  name=$$1; pattern=$$2; \
+	  pidfile="/tmp/pf-$${name}.pid"; \
+	  if [ -f "$$pidfile" ]; then \
+	    pid=$$(cat "$$pidfile"); \
+	    if kill -0 "$$pid" 2>/dev/null; then \
+	      kill "$$pid" 2>/dev/null || true; \
+	    fi; \
+	    rm -f "$$pidfile"; \
+	  else \
+	    pkill -f "$$pattern" 2>/dev/null || true; \
+	  fi; \
+	}; \
+	_pf_stop collector "kubectl -n iiot port-forward svc/collector-metrics 19090:9090"; \
+	_pf_stop ingestor  "kubectl -n iiot port-forward svc/ingestor 19091:9091"; \
+	_pf_stop bridge    "kubectl -n iiot port-forward svc/mqtt-bridge-metrics 19092:9092"; \
+	echo "Port-forwards stopped."
+
+## k3d-smoke: End-to-end health check: API, then all three metrics endpoints.
+k3d-smoke: k3d-guard-docker k3d-guard-kube
+	@echo "--- smoke: ingestor healthz ---"
+	@result=$$(curl -fsS http://localhost:8080/healthz 2>&1) || { \
+	  echo "FAIL: healthz — $$result"; exit 1; \
+	}; \
+	case "$$result" in \
+	  *'"status":"ok"'*) echo "  healthz OK" ;; \
+	  *) echo "FAIL: healthz response did not contain \"status\":\"ok\" — got: $$result"; exit 1 ;; \
+	esac
+	@echo "--- smoke: ensure metrics port-forwards are running ---"
+	@_ensure_pf() { \
+	  name=$$1; svc=$$2; local_port=$$3; remote_port=$$4; \
+	  pidfile="/tmp/pf-$${name}.pid"; \
+	  if [ -f "$$pidfile" ] && kill -0 "$$(cat $$pidfile)" 2>/dev/null; then \
+	    echo "  $$name port-forward already running"; \
+	  else \
+	    [ -f "$$pidfile" ] && rm -f "$$pidfile"; \
+	    kubectl -n iiot port-forward "$$svc" "$${local_port}:$${remote_port}" \
+	      >"/tmp/pf-$${name}.log" 2>&1 & \
+	    echo $$! >"$$pidfile"; \
+	    echo "  $$name port-forward started (pid $$(cat $$pidfile))"; \
+	    sleep 2; \
+	  fi; \
+	}; \
+	_ensure_pf collector svc/collector-metrics   19090 9090; \
+	_ensure_pf ingestor  svc/ingestor            19091 9091; \
+	_ensure_pf bridge    svc/mqtt-bridge-metrics 19092 9092
+	@echo "--- smoke: collector metrics ---"
+	@out=$$(curl -fsS http://localhost:19090/metrics 2>&1) || { \
+	  echo "FAIL: collector metrics unreachable — $$out"; exit 1; \
+	}; \
+	echo "$$out" | grep -q "iiot_publish_success_total" || { \
+	  echo "FAIL: iiot_publish_success_total not found in collector metrics"; exit 1; \
+	}; \
+	echo "  iiot_publish_success_total OK"
+	@echo "--- smoke: bridge metrics ---"
+	@out=$$(curl -fsS http://localhost:19092/metrics 2>&1) || { \
+	  echo "FAIL: bridge metrics unreachable — $$out"; exit 1; \
+	}; \
+	echo "$$out" | grep -q "bridge_forward_success_total" || { \
+	  echo "FAIL: bridge_forward_success_total not found in bridge metrics"; exit 1; \
+	}; \
+	echo "  bridge_forward_success_total OK"
+	@echo "--- smoke: ingestor metrics ---"
+	@out=$$(curl -fsS http://localhost:19091/metrics 2>&1) || { \
+	  echo "FAIL: ingestor metrics unreachable — $$out"; exit 1; \
+	}; \
+	echo "$$out" | grep -q "iiot_http_requests_total" || { \
+	  echo "FAIL: iiot_http_requests_total not found in ingestor metrics"; exit 1; \
+	}; \
+	echo "  iiot_http_requests_total OK"
+	@echo "SMOKE OK"
 
 ## k3d-logs: Tail logs from all iiot pods (Ctrl-C to exit)
 k3d-logs:
