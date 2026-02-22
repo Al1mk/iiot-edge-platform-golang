@@ -17,11 +17,19 @@ import (
 )
 
 // newTestMux returns a fresh ServeMux wired identically to main(), but with
-// maxSkew=0 (no skew enforcement) so tests can use any timestamp.
-// It also resets the package-level lastStore so tests are independent.
+// maxSkew=0 (no skew enforcement) and a fresh in-memory SQLite store so
+// tests are fully independent and don't touch the filesystem.
 func newTestMux(t *testing.T) *http.ServeMux {
 	t.Helper()
-	// Reset shared state before and after each test to prevent bleed-through.
+
+	// Each test gets its own in-memory SQLite database (no cross-test bleed).
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatalf("openStore(:memory:): %v", err)
+	}
+	t.Cleanup(func() { st.close() })
+
+	// Also reset the package-level in-memory lastStore.
 	lastMu.Lock()
 	lastStore = nil
 	lastMu.Unlock()
@@ -33,8 +41,9 @@ func newTestMux(t *testing.T) *http.ServeMux {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler)
-	mux.HandleFunc("POST /api/v1/telemetry", makeTelemetryHandler(0))
-	mux.HandleFunc("GET /api/v1/telemetry/last", lastTelemetryHandler)
+	mux.HandleFunc("POST /api/v1/telemetry", makeTelemetryHandler(0, st))
+	mux.HandleFunc("GET /api/v1/telemetry/last", makeLastHandler(st))
+	mux.HandleFunc("GET /api/v1/telemetry/recent", makeRecentHandler(st))
 	return mux
 }
 
@@ -92,7 +101,7 @@ func TestPostThenGetLast(t *testing.T) {
 		t.Fatalf("want 202, got %d: %s", resp.StatusCode, raw)
 	}
 
-	// GET /last
+	// GET /last — with DB the response is a telemetryRow (device_id at root).
 	resp2, err := http.Get(srv.URL + "/api/v1/telemetry/last")
 	if err != nil {
 		t.Fatalf("GET /last: %v", err)
@@ -104,19 +113,79 @@ func TestPostThenGetLast(t *testing.T) {
 	}
 
 	var result struct {
-		ReceivedAt int64 `json:"received_at"`
-		Payload    struct {
-			DeviceID string `json:"device_id"`
-		} `json:"payload"`
+		DeviceID   string `json:"device_id"`
+		ReceivedAt int64  `json:"received_at_unix"`
 	}
 	if err := json.NewDecoder(resp2.Body).Decode(&result); err != nil {
 		t.Fatalf("decode /last body: %v", err)
 	}
-	if result.Payload.DeviceID != "test-device" {
-		t.Fatalf("want device_id=test-device, got %q", result.Payload.DeviceID)
+	if result.DeviceID != "test-device" {
+		t.Fatalf("want device_id=test-device, got %q", result.DeviceID)
 	}
 	if result.ReceivedAt <= 0 {
-		t.Fatalf("want received_at > 0, got %d", result.ReceivedAt)
+		t.Fatalf("want received_at_unix > 0, got %d", result.ReceivedAt)
+	}
+}
+
+// TestRecentEndpoint checks GET /api/v1/telemetry/recent returns an array
+// with the most-recent record first and respects the device_id filter.
+// Not marked t.Parallel(): shares package-level lastStore with other stateful tests.
+func TestRecentEndpoint(t *testing.T) {
+	srv := httptest.NewServer(newTestMux(t))
+	defer srv.Close()
+
+	// POST two records for different devices.
+	for _, id := range []string{"dev-a", "dev-b"} {
+		body := strings.NewReader(validPayload(id))
+		resp, err := http.Post(srv.URL+"/api/v1/telemetry", "application/json", body)
+		if err != nil {
+			t.Fatalf("POST %s: %v", id, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("want 202 for %s, got %d", id, resp.StatusCode)
+		}
+	}
+
+	// GET /recent — no filter, should return both (newest first).
+	resp, err := http.Get(srv.URL + "/api/v1/telemetry/recent?limit=10")
+	if err != nil {
+		t.Fatalf("GET /recent: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("want 200, got %d: %s", resp.StatusCode, raw)
+	}
+
+	var rows []struct {
+		DeviceID string `json:"device_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		t.Fatalf("decode /recent: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("want 2 rows, got %d", len(rows))
+	}
+	// Newest first: dev-b was posted last.
+	if rows[0].DeviceID != "dev-b" {
+		t.Fatalf("want newest device=dev-b, got %q", rows[0].DeviceID)
+	}
+
+	// GET /recent?device_id=dev-a — should return exactly 1 row.
+	resp2, err := http.Get(srv.URL + "/api/v1/telemetry/recent?device_id=dev-a&limit=10")
+	if err != nil {
+		t.Fatalf("GET /recent?device_id=dev-a: %v", err)
+	}
+	defer resp2.Body.Close()
+	var filtered []struct {
+		DeviceID string `json:"device_id"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&filtered); err != nil {
+		t.Fatalf("decode filtered /recent: %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].DeviceID != "dev-a" {
+		t.Fatalf("want 1 row for dev-a, got %v", filtered)
 	}
 }
 
@@ -171,6 +240,7 @@ func TestRouteLabelStability(t *testing.T) {
 		{"/healthz", "/healthz"},
 		{"/api/v1/telemetry", "/api/v1/telemetry"},
 		{"/api/v1/telemetry/last", "/api/v1/telemetry/last"},
+		{"/api/v1/telemetry/recent", "/api/v1/telemetry/recent"},
 		{"/unknown", "other"},
 		{"/api/v1/telemetry/123", "other"},
 	}
@@ -217,19 +287,18 @@ func TestConcurrentPostsNoRace(t *testing.T) {
 		t.Fatalf("want 200, got %d", resp.StatusCode)
 	}
 
+	// With DB path, /last returns a telemetryRow (flat, not nested lastEntry).
 	var result struct {
-		ReceivedAt int64 `json:"received_at"`
-		Payload    struct {
-			DeviceID string `json:"device_id"`
-		} `json:"payload"`
+		DeviceID   string `json:"device_id"`
+		ReceivedAt int64  `json:"received_at_unix"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatalf("decode /last: %v", err)
 	}
-	if !strings.HasPrefix(result.Payload.DeviceID, "racer-") {
-		t.Fatalf("unexpected device_id %q", result.Payload.DeviceID)
+	if !strings.HasPrefix(result.DeviceID, "racer-") {
+		t.Fatalf("unexpected device_id %q", result.DeviceID)
 	}
 	if result.ReceivedAt <= 0 {
-		t.Fatalf("want received_at > 0, got %d", result.ReceivedAt)
+		t.Fatalf("want received_at_unix > 0, got %d", result.ReceivedAt)
 	}
 }

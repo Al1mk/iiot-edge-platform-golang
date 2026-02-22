@@ -20,7 +20,7 @@ KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
         manifests-lint \
         k3d-guard-docker k3d-guard-kube \
         k3d-cluster-up k3d-up k3d-down k3d-load k3d-deploy k3d-redeploy k3d-logs \
-        k3d-metrics k3d-metrics-down k3d-smoke k3d-e2e \
+        k3d-metrics k3d-metrics-down k3d-smoke k3d-e2e k3d-e2e-db \
         compose-up compose-down \
         clean help
 
@@ -300,6 +300,55 @@ k3d-e2e: k3d-guard-docker k3d-guard-kube
 	echo "  gauge OK"; \
 	\
 	echo "E2E OK"
+
+## k3d-e2e-db: Verify SQLite persistence: POST telemetry, GET /last and /recent by device_id.
+##   Requires the cluster to be up (make k3d-up). Starts/stops metrics port-forwards automatically.
+k3d-e2e-db: k3d-guard-docker k3d-guard-kube
+	@echo "--- e2e-db: start metrics port-forwards ---"
+	@$(MAKE) k3d-metrics
+	@echo "--- e2e-db: running DB checks (metrics-down runs on exit) ---"
+	@trap '$(MAKE) k3d-metrics-down' EXIT; \
+	set -e; \
+	\
+	echo "--- e2e-db: seed ClientIP affinity ---"; \
+	curl -s http://localhost:8080/healthz >/dev/null; \
+	\
+	echo "--- e2e-db: POST telemetry ---"; \
+	now=$$(date -u +"%Y-%m-%dT%H:%M:%SZ"); \
+	payload="{\"device_id\":\"e2e-db-test\",\"timestamp\":\"$${now}\",\"temperature_c\":19.0,\"pressure_hpa\":1015.0,\"humidity_pct\":60.0,\"status\":\"ok\"}"; \
+	http_code=$$(curl -s -o /tmp/e2e-db-post.out -w "%{http_code}" \
+	  -X POST http://localhost:8080/api/v1/telemetry \
+	  -H "Content-Type: application/json" \
+	  -d "$$payload"); \
+	echo "  POST /api/v1/telemetry → HTTP $${http_code}  body: $$(cat /tmp/e2e-db-post.out)"; \
+	[ "$$http_code" = "202" ] || { echo "FAIL: expected 202, got $${http_code}"; exit 1; }; \
+	echo "  POST OK"; \
+	\
+	echo "--- e2e-db: GET /api/v1/telemetry/last?device_id=e2e-db-test ---"; \
+	http_code=$$(curl -s -o /tmp/e2e-db-last.out -w "%{http_code}" \
+	  "http://localhost:8080/api/v1/telemetry/last?device_id=e2e-db-test"); \
+	body=$$(cat /tmp/e2e-db-last.out); \
+	echo "  GET /last → HTTP $${http_code}  body: $${body}"; \
+	[ "$$http_code" = "200" ] || { echo "FAIL: expected 200, got $${http_code}"; exit 1; }; \
+	echo "$$body" | grep -q '"e2e-db-test"' || { echo "FAIL: device_id e2e-db-test not found"; exit 1; }; \
+	echo "$$body" | grep -q '"received_at_unix"' || { echo "FAIL: received_at_unix not found"; exit 1; }; \
+	echo "  GET last OK"; \
+	\
+	echo "--- e2e-db: GET /api/v1/telemetry/recent?device_id=e2e-db-test&limit=1 ---"; \
+	http_code=$$(curl -s -o /tmp/e2e-db-recent.out -w "%{http_code}" \
+	  "http://localhost:8080/api/v1/telemetry/recent?device_id=e2e-db-test&limit=1"); \
+	body=$$(cat /tmp/e2e-db-recent.out); \
+	echo "  GET /recent → HTTP $${http_code}  body: $${body}"; \
+	[ "$$http_code" = "200" ] || { echo "FAIL: expected 200, got $${http_code}"; exit 1; }; \
+	echo "$$body" | grep -q '"e2e-db-test"' || { echo "FAIL: device_id e2e-db-test not in recent"; exit 1; }; \
+	echo "  GET recent OK"; \
+	\
+	echo "--- e2e-db: check DB metrics ---"; \
+	metrics=$$(curl -s http://localhost:19091/metrics); \
+	echo "$$metrics" | grep -q "iiot_db_up 1" || { echo "FAIL: iiot_db_up is not 1"; exit 1; }; \
+	echo "  iiot_db_up OK"; \
+	\
+	echo "E2E-DB OK"
 
 ## k3d-logs: Tail logs from all iiot pods (Ctrl-C to exit)
 k3d-logs:

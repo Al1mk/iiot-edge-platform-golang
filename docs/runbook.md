@@ -355,10 +355,29 @@ This target:
 
 On success it prints `E2E OK`.
 
+To additionally verify SQLite persistence (query endpoints and DB metrics):
+
+```bash
+make k3d-e2e-db
+```
+
+This target (cluster must already be up) checks:
+1. POST telemetry for device `e2e-db-test` → HTTP 202
+2. `GET /api/v1/telemetry/last?device_id=e2e-db-test` → HTTP 200 with `received_at_unix`
+3. `GET /api/v1/telemetry/recent?device_id=e2e-db-test&limit=1` → HTTP 200 with the record
+4. `iiot_db_up` metric is `1` in ingestor metrics
+
+On success it prints `E2E-DB OK`.
+
 > **Session affinity:** the ingestor `Service` sets `sessionAffinity: ClientIP` (3-hour timeout).
 > This pins all requests from the same source IP to the same replica, so a POST followed
 > immediately by a GET `/last` always hits the same in-memory store. The e2e target seeds
 > affinity with a `GET /healthz` before the POST to ensure the pin is established.
+
+> **SQLite persistence:** telemetry is written to a SQLite database at `INGESTOR_DB_PATH`
+> (default `/tmp/iiot.db`). In Kubernetes, `/tmp` is backed by an `emptyDir` volume — data
+> is durable for the pod's lifetime but lost on restart. The query endpoints (`/last`,
+> `/recent`) are backed by the DB; the in-memory `lastStore` is kept as a fast fallback only.
 
 ### 9. Tail all logs at once
 
@@ -383,9 +402,10 @@ make test        # go test ./... -v -race -timeout 60s
 make test-race   # explicit alias for the same command (useful in CI scripts)
 ```
 
-Coverage includes the ingestor's `GET /api/v1/telemetry/last` endpoint, the Prometheus
-gauge, `routeLabel` stability, and a 50-goroutine concurrent-POST test that will surface
-any mutex omission under `-race`.
+Coverage includes: `GET /api/v1/telemetry/last` and `/recent` (backed by in-memory SQLite),
+the Prometheus gauge, `routeLabel` stability, and a 50-goroutine concurrent-POST test that
+surfaces mutex omissions under `-race`. Each test gets its own isolated `:memory:` SQLite
+database — no filesystem access, no cross-test bleed.
 
 ---
 
@@ -434,6 +454,7 @@ INGESTOR_URL=http://localhost:8080/api/v1/telemetry \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAX_TS_SKEW` | `24h` | Maximum allowed timestamp skew relative to server time |
+| `INGESTOR_DB_PATH` | `/tmp/iiot.db` | Path to the SQLite database file. In Kubernetes the `/tmp` directory is backed by an emptyDir volume so data is lost on pod restart. Mount a PersistentVolume here for durable storage. |
 
 ### MQTT Bridge
 

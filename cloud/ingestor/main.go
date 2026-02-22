@@ -45,12 +45,27 @@ var (
 		Name: "iiot_last_telemetry_timestamp_seconds",
 		Help: "Unix timestamp (seconds) of the last successfully accepted telemetry reading. 0 if none received yet.",
 	})
+
+	// dbUp is 1 when the SQLite database is reachable, 0 otherwise.
+	// It is updated on every successful/failed DB write.
+	dbUp = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "iiot_db_up",
+		Help: "1 if the ingestor SQLite database is reachable, 0 otherwise.",
+	})
+
+	// dbWriteFailTotal counts failed INSERT attempts.
+	dbWriteFailTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "iiot_db_write_fail_total",
+		Help: "Total number of failed telemetry INSERT operations.",
+	})
 )
 
 // lastEntry holds the most-recently accepted telemetry reading and the wall
 // clock time it was stored. Protected by lastMu.
+// Retained for backward-compat with existing tests and the in-process /last
+// fast path (avoids a DB read on every request when DB is unavailable).
 type lastEntry struct {
-	ReceivedAt int64                  `json:"received_at"` // unix seconds
+	ReceivedAt int64                   `json:"received_at"` // unix seconds
 	Payload    models.TelemetryReading `json:"payload"`
 }
 
@@ -96,7 +111,7 @@ func healthzHandler(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func makeTelemetryHandler(maxSkew time.Duration) http.HandlerFunc {
+func makeTelemetryHandler(maxSkew time.Duration, st *store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Apply body limit before any reads.
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB
@@ -132,31 +147,98 @@ func makeTelemetryHandler(maxSkew time.Duration) http.HandlerFunc {
 			"status", reading.Status,
 		)
 
-		// TODO: Forward to Kafka topic or write to TimescaleDB / InfluxDB.
+		receivedAt := time.Now().Unix()
 
-		// Store last accepted reading and update the Prometheus gauge.
-		now := time.Now().Unix()
+		// Persist to SQLite. Log but do not fail the request on DB error.
+		if st != nil {
+			if err := st.insert(reading, receivedAt); err != nil {
+				logger.Error("db insert failed", "error", err)
+				dbWriteFailTotal.Inc()
+				dbUp.Set(0)
+			} else {
+				dbUp.Set(1)
+			}
+		}
+
+		// Update in-memory last entry and gauge (fast path, always runs).
 		lastMu.Lock()
-		lastStore = &lastEntry{ReceivedAt: now, Payload: reading}
+		lastStore = &lastEntry{ReceivedAt: receivedAt, Payload: reading}
 		lastMu.Unlock()
-		lastTelemetryTimestamp.Set(float64(now))
+		lastTelemetryTimestamp.Set(float64(receivedAt))
 
 		writeJSON(w, http.StatusAccepted, map[string]string{"result": "accepted"})
 	}
 }
 
-// lastTelemetryHandler serves GET /api/v1/telemetry/last.
-// Returns 404 if no telemetry has been received since startup; otherwise 200.
-func lastTelemetryHandler(w http.ResponseWriter, _ *http.Request) {
-	lastMu.RLock()
-	entry := lastStore
-	lastMu.RUnlock()
+// makeLastHandler serves GET /api/v1/telemetry/last[?device_id=<id>].
+// When a DB is available it queries there (durable across restarts).
+// Falls back to the in-memory store if st is nil.
+func makeLastHandler(st *store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		deviceID := r.URL.Query().Get("device_id")
 
-	if entry == nil {
-		writeError(w, http.StatusNotFound, "no_telemetry", "no telemetry received")
-		return
+		// DB path.
+		if st != nil {
+			row, err := st.queryLast(deviceID)
+			if err != nil {
+				logger.Error("db queryLast failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "db_error", "database query failed")
+				return
+			}
+			if row == nil {
+				writeError(w, http.StatusNotFound, "no_telemetry", "no telemetry received")
+				return
+			}
+			writeJSON(w, http.StatusOK, row)
+			return
+		}
+
+		// In-memory fallback (no DB).
+		lastMu.RLock()
+		entry := lastStore
+		lastMu.RUnlock()
+		if entry == nil {
+			writeError(w, http.StatusNotFound, "no_telemetry", "no telemetry received")
+			return
+		}
+		writeJSON(w, http.StatusOK, entry)
 	}
-	writeJSON(w, http.StatusOK, entry)
+}
+
+// makeRecentHandler serves GET /api/v1/telemetry/recent[?limit=N&device_id=<id>].
+// Requires a DB; returns 503 if none is configured.
+func makeRecentHandler(st *store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeError(w, http.StatusServiceUnavailable, "no_db", "persistence not configured")
+			return
+		}
+
+		deviceID := r.URL.Query().Get("device_id")
+
+		limit := 100
+		if s := r.URL.Query().Get("limit"); s != "" {
+			n, err := strconv.Atoi(s)
+			if err != nil || n < 1 {
+				n = 1
+			} else if n > 500 {
+				n = 500
+			}
+			limit = n
+		}
+
+		rows, err := st.queryRecent(deviceID, limit)
+		if err != nil {
+			logger.Error("db queryRecent failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "db_error", "database query failed")
+			return
+		}
+		// Return an empty array rather than null when no rows.
+		if rows == nil {
+			rows = []telemetryRow{}
+		}
+		writeJSON(w, http.StatusOK, rows)
+	}
 }
 
 // routeLabel returns a stable Prometheus label for the request path,
@@ -169,6 +251,8 @@ func routeLabel(r *http.Request) string {
 		return "/api/v1/telemetry"
 	case "/api/v1/telemetry/last":
 		return "/api/v1/telemetry/last"
+	case "/api/v1/telemetry/recent":
+		return "/api/v1/telemetry/recent"
 	default:
 		return "other"
 	}
@@ -240,18 +324,32 @@ func main() {
 	addr := ":8080"
 	metricsAddr := ":9091"
 	maxSkew := parseMaxSkew()
+	dbPath := getEnv("INGESTOR_DB_PATH", "/tmp/iiot.db")
 
 	logger.Info("starting ingestor",
 		"version", version,
 		"addr", addr,
 		"metrics_addr", metricsAddr,
 		"max_ts_skew", maxSkew.String(),
+		"db_path", dbPath,
 	)
+
+	// Open SQLite store. Non-fatal: if it fails the ingestor still serves
+	// requests; DB metrics will reflect the outage.
+	st, err := openStore(dbPath)
+	if err != nil {
+		logger.Error("failed to open db; running without persistence", "error", err)
+		dbUp.Set(0)
+	} else {
+		dbUp.Set(1)
+		defer st.close()
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler)
-	mux.HandleFunc("POST /api/v1/telemetry", makeTelemetryHandler(maxSkew))
-	mux.HandleFunc("GET /api/v1/telemetry/last", lastTelemetryHandler)
+	mux.HandleFunc("POST /api/v1/telemetry", makeTelemetryHandler(maxSkew, st))
+	mux.HandleFunc("GET /api/v1/telemetry/last", makeLastHandler(st))
+	mux.HandleFunc("GET /api/v1/telemetry/recent", makeRecentHandler(st))
 
 	srv := &http.Server{
 		Addr:         addr,

@@ -32,6 +32,8 @@ spec:
           env:
             - name: MAX_TS_SKEW
               value: "24h"
+            - name: INGESTOR_DB_PATH
+              value: /tmp/iiot.db
           ports:
             - name: http
               containerPort: 8080
@@ -66,3 +68,10 @@ spec:
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
