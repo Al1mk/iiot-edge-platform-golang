@@ -15,7 +15,7 @@ K3D_CLUSTER    := iiot
 KUSTOMIZE_BASE    := deploy/kustomize/base
 KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
 
-.PHONY: fmt lint test build \
+.PHONY: fmt lint test test-race build \
         docker-build \
         manifests-lint \
         k3d-guard-docker k3d-guard-kube \
@@ -39,6 +39,9 @@ lint:
 ## test: Run all unit tests with race detector
 test:
 	go test ./... -v -race -timeout 60s
+
+## test-race: Explicit alias for test — always runs with -race (useful for CI)
+test-race: test
 
 ## build: Compile all binaries to bin/
 build:

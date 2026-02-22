@@ -374,6 +374,21 @@ make k3d-down
 
 ---
 
+## Running tests
+
+Run before every push to catch regressions and data races:
+
+```bash
+make test        # go test ./... -v -race -timeout 60s
+make test-race   # explicit alias for the same command (useful in CI scripts)
+```
+
+Coverage includes the ingestor's `GET /api/v1/telemetry/last` endpoint, the Prometheus
+gauge, `routeLabel` stability, and a 50-goroutine concurrent-POST test that will surface
+any mutex omission under `-race`.
+
+---
+
 ## Local binary build (no Docker)
 
 Requires Go 1.22+.
