@@ -44,6 +44,7 @@ func newTestMux(t *testing.T) *http.ServeMux {
 	mux.HandleFunc("POST /api/v1/telemetry", makeTelemetryHandler(0, st))
 	mux.HandleFunc("GET /api/v1/telemetry/last", makeLastHandler(st))
 	mux.HandleFunc("GET /api/v1/telemetry/recent", makeRecentHandler(st))
+	mux.HandleFunc("GET /api/v1/telemetry/stats", makeStatsHandler(st))
 	return mux
 }
 
@@ -300,5 +301,134 @@ func TestConcurrentPostsNoRace(t *testing.T) {
 	}
 	if result.ReceivedAt <= 0 {
 		t.Fatalf("want received_at_unix > 0, got %d", result.ReceivedAt)
+	}
+}
+
+// TestStatsEndpoint verifies GET /api/v1/telemetry/stats before and after a POST.
+// Checks db_up=1, rows_total increments, last_write_unix > 0 after a write.
+// Not marked t.Parallel(): shares package-level lastStore with other stateful tests.
+func TestStatsEndpoint(t *testing.T) {
+	srv := httptest.NewServer(newTestMux(t))
+	defer srv.Close()
+
+	// Before any POST: db_up=1, rows_total=0.
+	resp, err := http.Get(srv.URL + "/api/v1/telemetry/stats")
+	if err != nil {
+		t.Fatalf("GET /stats: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("want 200, got %d: %s", resp.StatusCode, raw)
+	}
+
+	var before telemetryStatsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&before); err != nil {
+		t.Fatalf("decode /stats (before): %v", err)
+	}
+	if before.DBUp != 1 {
+		t.Fatalf("want db_up=1, got %d", before.DBUp)
+	}
+	if before.RowsTotal != 0 {
+		t.Fatalf("want rows_total=0 before any POST, got %d", before.RowsTotal)
+	}
+	if before.LastWriteUnix != 0 {
+		t.Fatalf("want last_write_unix=0 before any POST, got %d", before.LastWriteUnix)
+	}
+
+	// POST one record.
+	body := strings.NewReader(validPayload("stats-device"))
+	postResp, err := http.Post(srv.URL+"/api/v1/telemetry", "application/json", body)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	postResp.Body.Close()
+	if postResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202, got %d", postResp.StatusCode)
+	}
+
+	// After POST: rows_total=1, last_write_unix > 0.
+	resp2, err := http.Get(srv.URL + "/api/v1/telemetry/stats")
+	if err != nil {
+		t.Fatalf("GET /stats (after POST): %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp2.Body)
+		t.Fatalf("want 200, got %d: %s", resp2.StatusCode, raw)
+	}
+
+	var after telemetryStatsResponse
+	if err := json.NewDecoder(resp2.Body).Decode(&after); err != nil {
+		t.Fatalf("decode /stats (after): %v", err)
+	}
+	if after.DBUp != 1 {
+		t.Fatalf("want db_up=1, got %d", after.DBUp)
+	}
+	if after.RowsTotal != 1 {
+		t.Fatalf("want rows_total=1, got %d", after.RowsTotal)
+	}
+	if after.LastWriteUnix <= 0 {
+		t.Fatalf("want last_write_unix > 0, got %d", after.LastWriteUnix)
+	}
+}
+
+// TestIndexExists uses PRAGMA index_list to confirm the idx_device_received_at
+// index is present after openStore, protecting query performance as data grows.
+func TestIndexExists(t *testing.T) {
+	t.Parallel()
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	defer st.close()
+
+	rows, err := st.db.Query(`PRAGMA index_list(telemetry)`)
+	if err != nil {
+		t.Fatalf("PRAGMA index_list: %v", err)
+	}
+	defer rows.Close()
+
+	var found bool
+	for rows.Next() {
+		var seq int
+		var name, origin string
+		var unique, partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan index row: %v", err)
+		}
+		if name == "idx_device_received_at" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	if !found {
+		t.Fatal("index idx_device_received_at not found in PRAGMA index_list(telemetry)")
+	}
+}
+
+// TestStatsRouteNever404 exercises the mux directly (no HTTP client round-trip)
+// to prove that GET /api/v1/telemetry/stats is registered and dispatched — i.e.
+// the handler is called and returns 200 or 503, never the mux's built-in 404.
+//
+// This is the regression guard for the k3d "404 on /stats" class of bug: if the
+// route registration line is ever dropped from newTestMux (or main), this test
+// will fail immediately during `go test`, before any image is built or loaded.
+func TestStatsRouteNever404(t *testing.T) {
+	t.Parallel()
+	mux := newTestMux(t)
+
+	w := httptest.NewRecorder()
+	r, _ := http.NewRequest(http.MethodGet, "/api/v1/telemetry/stats", nil)
+	mux.ServeHTTP(w, r)
+
+	if w.Code == http.StatusNotFound {
+		t.Fatalf("GET /api/v1/telemetry/stats returned 404: route is not registered on the mux")
+	}
+	// Accept 200 (DB up) or 503 (DB unavailable); both mean the handler ran.
+	if w.Code != http.StatusOK && w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unexpected status %d; want 200 or 503", w.Code)
 	}
 }

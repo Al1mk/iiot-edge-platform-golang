@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,7 +18,13 @@ import (
 // opened with WAL mode and a single *sql.DB whose connection pool serialises
 // writes while allowing concurrent reads.
 type store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string // "" for :memory:
+
+	// Counters maintained in-process; updated atomically on each insert and
+	// read back by statsSnapshot for the /stats endpoint and Prometheus gauges.
+	rowCount    atomic.Int64
+	lastWriteAt atomic.Int64 // unix seconds of most-recent successful insert
 }
 
 // openStore opens (or creates) the SQLite database at path and runs the
@@ -36,7 +44,16 @@ func openStore(path string) (*store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return &store{db: db}, nil
+
+	st := &store{db: db, path: path}
+
+	// Populate rowCount from the existing table so gauges are correct on startup.
+	var n int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM telemetry`).Scan(&n); err == nil {
+		st.rowCount.Store(n)
+	}
+
+	return st, nil
 }
 
 func migrate(db *sql.DB) error {
@@ -52,13 +69,13 @@ CREATE TABLE IF NOT EXISTS telemetry (
     status        TEXT    NOT NULL,
     raw_json      TEXT    NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_telemetry_device_received
+CREATE INDEX IF NOT EXISTS idx_device_received_at
     ON telemetry (device_id, received_at_unix DESC);
 `)
 	return err
 }
 
-// insert persists one accepted telemetry reading.
+// insert persists one accepted telemetry reading and updates in-process counters.
 func (s *store) insert(r models.TelemetryReading, receivedAt int64) error {
 	raw, err := json.Marshal(r)
 	if err != nil {
@@ -78,7 +95,34 @@ func (s *store) insert(r models.TelemetryReading, receivedAt int64) error {
 		r.Status,
 		string(raw),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	s.rowCount.Add(1)
+	s.lastWriteAt.Store(receivedAt)
+	return nil
+}
+
+// dbStats holds the values returned by statsSnapshot.
+type dbStats struct {
+	RowsTotal     int64
+	LastWriteUnix int64
+	FileBytes     int64 // 0 for :memory: databases
+}
+
+// statsSnapshot reads the current counters without hitting SQLite.
+// Safe for concurrent use.
+func (s *store) statsSnapshot() dbStats {
+	snap := dbStats{
+		RowsTotal:     s.rowCount.Load(),
+		LastWriteUnix: s.lastWriteAt.Load(),
+	}
+	if s.path != "" && s.path != ":memory:" {
+		if fi, err := os.Stat(s.path); err == nil {
+			snap.FileBytes = fi.Size()
+		}
+	}
+	return snap
 }
 
 // telemetryRow is what the query endpoints return.

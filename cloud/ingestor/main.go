@@ -58,6 +58,24 @@ var (
 		Name: "iiot_db_write_fail_total",
 		Help: "Total number of failed telemetry INSERT operations.",
 	})
+
+	// dbRowsTotal tracks the current number of rows in the telemetry table.
+	dbRowsTotal = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "iiot_db_rows_total",
+		Help: "Current number of rows in the telemetry table.",
+	})
+
+	// dbFileBytes is the size of the SQLite file in bytes (0 for :memory:).
+	dbFileBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "iiot_db_file_bytes",
+		Help: "Size of the SQLite database file in bytes. 0 for in-memory databases.",
+	})
+
+	// dbLastWriteUnix is the unix timestamp of the most-recent successful INSERT.
+	dbLastWriteUnix = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "iiot_db_last_write_unix",
+		Help: "Unix timestamp (seconds) of the most-recent successful telemetry INSERT. 0 if none.",
+	})
 )
 
 // lastEntry holds the most-recently accepted telemetry reading and the wall
@@ -157,6 +175,10 @@ func makeTelemetryHandler(maxSkew time.Duration, st *store) http.HandlerFunc {
 				dbUp.Set(0)
 			} else {
 				dbUp.Set(1)
+				snap := st.statsSnapshot()
+				dbRowsTotal.Set(float64(snap.RowsTotal))
+				dbLastWriteUnix.Set(float64(snap.LastWriteUnix))
+				dbFileBytes.Set(float64(snap.FileBytes))
 			}
 		}
 
@@ -241,6 +263,38 @@ func makeRecentHandler(st *store) http.HandlerFunc {
 	}
 }
 
+// telemetryStatsResponse is the JSON body returned by GET /api/v1/telemetry/stats.
+type telemetryStatsResponse struct {
+	DBUp          int   `json:"db_up"`
+	RowsTotal     int64 `json:"rows_total"`
+	LastWriteUnix int64 `json:"last_write_unix"`
+	DBFileBytes   int64 `json:"db_file_bytes"`
+}
+
+// makeStatsHandler serves GET /api/v1/telemetry/stats.
+// Returns 200 with current DB statistics when the DB is available, 503 otherwise.
+// All fields fall back to zero when st is nil so callers never get a panic.
+func makeStatsHandler(st *store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if st == nil {
+			writeJSON(w, http.StatusServiceUnavailable, telemetryStatsResponse{})
+			return
+		}
+		if err := st.ping(); err != nil {
+			logger.Error("db ping failed in stats handler", "error", err)
+			writeJSON(w, http.StatusServiceUnavailable, telemetryStatsResponse{})
+			return
+		}
+		snap := st.statsSnapshot()
+		writeJSON(w, http.StatusOK, telemetryStatsResponse{
+			DBUp:          1,
+			RowsTotal:     snap.RowsTotal,
+			LastWriteUnix: snap.LastWriteUnix,
+			DBFileBytes:   snap.FileBytes,
+		})
+	}
+}
+
 // routeLabel returns a stable Prometheus label for the request path,
 // avoiding cardinality explosion from raw URLs with IDs or query strings.
 func routeLabel(r *http.Request) string {
@@ -253,6 +307,8 @@ func routeLabel(r *http.Request) string {
 		return "/api/v1/telemetry/last"
 	case "/api/v1/telemetry/recent":
 		return "/api/v1/telemetry/recent"
+	case "/api/v1/telemetry/stats":
+		return "/api/v1/telemetry/stats"
 	default:
 		return "other"
 	}
@@ -342,6 +398,10 @@ func main() {
 		dbUp.Set(0)
 	} else {
 		dbUp.Set(1)
+		snap := st.statsSnapshot()
+		dbRowsTotal.Set(float64(snap.RowsTotal))
+		dbLastWriteUnix.Set(float64(snap.LastWriteUnix))
+		dbFileBytes.Set(float64(snap.FileBytes))
 		defer st.close()
 	}
 
@@ -350,6 +410,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/telemetry", makeTelemetryHandler(maxSkew, st))
 	mux.HandleFunc("GET /api/v1/telemetry/last", makeLastHandler(st))
 	mux.HandleFunc("GET /api/v1/telemetry/recent", makeRecentHandler(st))
+	mux.HandleFunc("GET /api/v1/telemetry/stats", makeStatsHandler(st))
 
 	srv := &http.Server{
 		Addr:         addr,

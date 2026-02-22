@@ -366,6 +366,7 @@ This target (cluster must already be up) checks:
 2. `GET /api/v1/telemetry/last?device_id=e2e-db-test` → HTTP 200 with `received_at_unix`
 3. `GET /api/v1/telemetry/recent?device_id=e2e-db-test&limit=1` → HTTP 200 with the record
 4. `iiot_db_up` metric is `1` in ingestor metrics
+5. `GET /api/v1/telemetry/stats` → HTTP 200 with `db_up=1` and `rows_total >= 1`
 
 On success it prints `E2E-DB OK`.
 
@@ -378,6 +379,68 @@ On success it prints `E2E-DB OK`.
 > (default `/tmp/iiot.db`). In Kubernetes, `/tmp` is backed by an `emptyDir` volume — data
 > is durable for the pod's lifetime but lost on restart. The query endpoints (`/last`,
 > `/recent`) are backed by the DB; the in-memory `lastStore` is kept as a fast fallback only.
+
+### 8a. DB observability: stats endpoint and Prometheus metrics
+
+The ingestor exposes a stats endpoint and three DB-specific Prometheus gauges for
+production monitoring and quick operational debugging.
+
+#### Stats endpoint
+
+```bash
+# Inspect current DB state (no cluster required — works in Docker Compose too)
+curl -s http://localhost:8080/api/v1/telemetry/stats | jq .
+```
+
+Example response:
+
+```json
+{
+  "db_up": 1,
+  "rows_total": 423,
+  "last_write_unix": 1771776790,
+  "db_file_bytes": 81920
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `db_up` | `1` if SQLite is reachable; `0` if unavailable (response is HTTP 503) |
+| `rows_total` | Current row count in the `telemetry` table |
+| `last_write_unix` | Unix timestamp (seconds) of the most-recent successful INSERT; `0` if none |
+| `db_file_bytes` | Size of the SQLite file on disk in bytes; `0` for `:memory:` databases |
+
+Values are maintained in-process with atomic counters and read without hitting SQLite on
+every request, so the endpoint is cheap to call.
+
+#### Prometheus gauges (scraped from `:9091/metrics`)
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `iiot_db_up` | Gauge | 1 if DB is reachable, 0 otherwise (unchanged) |
+| `iiot_db_rows_total` | Gauge | Current number of rows in the telemetry table |
+| `iiot_db_file_bytes` | Gauge | SQLite file size in bytes; 0 for in-memory |
+| `iiot_db_last_write_unix` | Gauge | Unix timestamp of last successful INSERT; 0 if none |
+
+All four gauges are populated at startup from the existing DB state and updated on
+every successful INSERT, so they are accurate immediately after pod start.
+
+```bash
+# Quick manual check via port-forward (assumes make k3d-metrics is running)
+curl -s http://localhost:19091/metrics | grep iiot_db
+```
+
+#### Why the index was added
+
+The `idx_device_received_at` index on `(device_id, received_at_unix DESC)` covers the
+two most common query patterns:
+
+- `GET /last?device_id=X` — seeks directly to the newest row for a device
+- `GET /recent?device_id=X` — scans the top-N rows for a device in order
+
+Without this index both queries would full-scan the table. With it, SQLite uses an index
+range scan that stays O(log N) as the table grows. The index is created idempotently by
+`CREATE INDEX IF NOT EXISTS`, so it is safe on both new and pre-existing databases.
 
 ### 9. Tail all logs at once
 
@@ -455,6 +518,19 @@ INGESTOR_URL=http://localhost:8080/api/v1/telemetry \
 |----------|---------|-------------|
 | `MAX_TS_SKEW` | `24h` | Maximum allowed timestamp skew relative to server time |
 | `INGESTOR_DB_PATH` | `/tmp/iiot.db` | Path to the SQLite database file. In Kubernetes the `/tmp` directory is backed by an emptyDir volume so data is lost on pod restart. Mount a PersistentVolume here for durable storage. |
+
+#### Ingestor Prometheus metrics (`:9091/metrics`)
+
+| Metric | Description |
+|--------|-------------|
+| `iiot_http_requests_total` | HTTP requests by method, route, and status code |
+| `iiot_http_request_duration_seconds` | HTTP request latency histogram |
+| `iiot_last_telemetry_timestamp_seconds` | Unix timestamp of last accepted reading |
+| `iiot_db_up` | 1 if SQLite DB is reachable, 0 otherwise |
+| `iiot_db_write_fail_total` | Total failed INSERT operations |
+| `iiot_db_rows_total` | Current row count in the telemetry table |
+| `iiot_db_file_bytes` | SQLite file size in bytes (0 for in-memory) |
+| `iiot_db_last_write_unix` | Unix timestamp of last successful INSERT (0 if none) |
 
 ### MQTT Bridge
 

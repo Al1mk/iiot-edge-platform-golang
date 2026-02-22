@@ -56,3 +56,4 @@ Desktop.ini
 
 # Logs
 *.log
+/ingestor

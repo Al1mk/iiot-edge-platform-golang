@@ -304,16 +304,33 @@ k3d-e2e: k3d-guard-docker k3d-guard-kube
 ## k3d-e2e-db: Verify SQLite persistence: POST telemetry, GET /last and /recent by device_id.
 ##   Requires the cluster to be up (make k3d-up). Starts/stops metrics port-forwards automatically.
 k3d-e2e-db: k3d-guard-docker k3d-guard-kube
-	@echo "--- e2e-db: start metrics port-forwards ---"
 	@$(MAKE) k3d-metrics
-	@echo "--- e2e-db: running DB checks (metrics-down runs on exit) ---"
 	@trap '$(MAKE) k3d-metrics-down' EXIT; \
 	set -e; \
 	\
+	_wait_healthz() { \
+	  _i=0; \
+	  while [ "$$_i" -lt 60 ]; do \
+	    _body=$$(curl -sS --max-time 1 http://localhost:8080/healthz 2>/dev/null || true); \
+	    case "$$_body" in \
+	      *'"status":"ok"'*) echo "  healthz OK (try $$(( _i + 1 )))"; return 0 ;; \
+	    esac; \
+	    [ "$$(( _i % 10 ))" = "0" ] && echo "  waiting for healthz... ($${_i}/60)"; \
+	    _i=$$(( _i + 1 )); \
+	    sleep 0.2; \
+	  done; \
+	  echo "FAIL: healthz not ready after 60 tries"; \
+	  kubectl -n iiot get pods -o wide || true; \
+	  kubectl -n iiot get endpointslice -l kubernetes.io/service-name=ingestor || true; \
+	  kubectl -n iiot logs -l app.kubernetes.io/name=ingestor --tail=80 --prefix || true; \
+	  exit 1; \
+	}; \
+	\
 	echo "--- e2e-db: seed ClientIP affinity ---"; \
-	curl -s http://localhost:8080/healthz >/dev/null; \
+	_wait_healthz; \
 	\
 	echo "--- e2e-db: POST telemetry ---"; \
+	_wait_healthz; \
 	now=$$(date -u +"%Y-%m-%dT%H:%M:%SZ"); \
 	payload="{\"device_id\":\"e2e-db-test\",\"timestamp\":\"$${now}\",\"temperature_c\":19.0,\"pressure_hpa\":1015.0,\"humidity_pct\":60.0,\"status\":\"ok\"}"; \
 	http_code=$$(curl -s -o /tmp/e2e-db-post.out -w "%{http_code}" \
@@ -347,6 +364,18 @@ k3d-e2e-db: k3d-guard-docker k3d-guard-kube
 	metrics=$$(curl -s http://localhost:19091/metrics); \
 	echo "$$metrics" | grep -q "iiot_db_up 1" || { echo "FAIL: iiot_db_up is not 1"; exit 1; }; \
 	echo "  iiot_db_up OK"; \
+	\
+	echo "--- e2e-db: GET /api/v1/telemetry/stats ---"; \
+	_wait_healthz; \
+	http_code=$$(curl -s -o /tmp/e2e-db-stats.out -w "%{http_code}" \
+	  "http://localhost:8080/api/v1/telemetry/stats"); \
+	body=$$(cat /tmp/e2e-db-stats.out); \
+	echo "  GET /stats → HTTP $${http_code}  body: $${body}"; \
+	[ "$$http_code" = "200" ] || { echo "FAIL: expected 200, got $${http_code}"; exit 1; }; \
+	echo "$$body" | grep -q '"db_up":1' || { echo "FAIL: db_up != 1 in /stats"; exit 1; }; \
+	rows_total=$$(echo "$$body" | sed 's/.*"rows_total":\([0-9]*\).*/\1/'); \
+	[ "$$(( rows_total >= 1 ))" = "1" ] 2>/dev/null || { echo "FAIL: rows_total < 1 in /stats"; exit 1; }; \
+	echo "  /stats OK (rows_total=$${rows_total})"; \
 	\
 	echo "E2E-DB OK"
 
