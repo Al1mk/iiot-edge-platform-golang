@@ -9,8 +9,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      CGO_ENABLED: 0
 
     steps:
       - name: Checkout
@@ -29,13 +27,21 @@ jobs:
         run: go vet ./...
 
       - name: Test
+        env:
+          CGO_ENABLED: 1
         run: go test ./... -race -timeout 60s
 
       - name: Build ingestor
+        env:
+          CGO_ENABLED: 0
         run: go build ./cloud/ingestor
 
       - name: Build mqtt-bridge
+        env:
+          CGO_ENABLED: 0
         run: go build ./cloud/mqtt-bridge
 
       - name: Build collector
+        env:
+          CGO_ENABLED: 0
         run: go build ./edge/collector
