@@ -35,3 +35,10 @@ patches:
     target:
       kind: Service
       name: ingestor
+  # Force replicas=1 locally. The ingestor PVC is ReadWriteOnce; SQLite does not
+  # support concurrent writers. Two replicas serve no purpose on a single-node
+  # k3d cluster and would cause SQLITE_BUSY errors or Pending pods on multi-node.
+  - path: ingestor-replicas-patch.yaml
+    target:
+      kind: Deployment
+      name: ingestor

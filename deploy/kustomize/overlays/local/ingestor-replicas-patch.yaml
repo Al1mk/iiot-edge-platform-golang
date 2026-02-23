@@ -1,0 +1,20 @@
+# Strategic merge patch: force ingestor to 1 replica in the local k3d cluster.
+#
+# The ingestor PVC uses accessModes: ReadWriteOnce. On a single-node k3d cluster
+# both pods would land on the same node and could technically share an RWO volume,
+# but running 2 replicas is still wrong for local development:
+#   - SQLite only supports one writer; concurrent writes from two pods cause
+#     SQLITE_BUSY errors even with WAL mode and a short busy_timeout.
+#   - SessionAffinity keeps requests pinned to one pod, so the second replica
+#     serves no useful purpose locally.
+# On a multi-node cluster an RWO PVC cannot be mounted by pods on different nodes
+# at all, so replicas > 1 would leave the second pod Pending indefinitely.
+# Set replicas: 1 here (overlay only). The base keeps replicas: 2 for
+# staging/production overlays that use ReadWriteMany storage or a proper HA setup.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestor
+  namespace: iiot
+spec:
+  replicas: 1

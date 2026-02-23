@@ -41,11 +41,12 @@ spec:
             - name: metrics
               containerPort: 9091
               protocol: TCP
-          # Readiness: probe /healthz (app-specific endpoint) — pod only gets
-          # traffic once the HTTP server is fully up.
+          # Readiness: probe /readyz — pod only gets traffic once the HTTP server
+          # is up AND the SQLite store is reachable. This is a true readiness
+          # gate; it differs from /healthz which is a shallow liveness check.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10

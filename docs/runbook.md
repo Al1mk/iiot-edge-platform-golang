@@ -380,6 +380,17 @@ On success it prints `E2E-DB OK`.
 > is durable for the pod's lifetime but lost on restart. The query endpoints (`/last`,
 > `/recent`) are backed by the DB; the in-memory `lastStore` is kept as a fast fallback only.
 
+> **Liveness vs readiness probes:**
+> - `GET /healthz` — liveness: shallow process-alive check; always returns `{"status":"ok"}` as long as the HTTP server is running. Kubernetes uses this to decide whether to restart the pod.
+> - `GET /readyz` — readiness: DB-aware check; returns `200 {"status":"ok"}` only when the SQLite store is reachable (or when no DB is configured). Kubernetes removes the pod from service load-balancing while this returns 503. Wait for `/readyz` — not `/healthz` — before issuing DB-dependent requests.
+
+> **Local overlay — replicas: 1:** the `deploy/kustomize/overlays/local/ingestor-replicas-patch.yaml`
+> patch forces the ingestor to a single replica in the k3d environment. The base manifest keeps
+> `replicas: 2` for staging/production overlays that pair it with a `ReadWriteMany` volume or a
+> proper HA setup. Running two replicas locally is wrong for two reasons: the SQLite file only
+> supports one writer (concurrent writes from two pods cause `SQLITE_BUSY` errors), and both pods
+> on a single-node k3d cluster would compete for the same `ReadWriteOnce` PVC if one is mounted.
+
 ### 8a. DB observability: stats endpoint and Prometheus metrics
 
 The ingestor exposes a stats endpoint and three DB-specific Prometheus gauges for
@@ -517,7 +528,11 @@ INGESTOR_URL=http://localhost:8080/api/v1/telemetry \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAX_TS_SKEW` | `24h` | Maximum allowed timestamp skew relative to server time |
-| `INGESTOR_DB_PATH` | `/tmp/iiot.db` | Path to the SQLite database file. In Kubernetes the `/tmp` directory is backed by an emptyDir volume so data is lost on pod restart. Mount a PersistentVolume here for durable storage. |
+| `INGESTOR_DB_PATH` | `/tmp/iiot.db` | Path to the SQLite database file. In Kubernetes the `/tmp` directory is backed by an emptyDir volume so data is lost on pod restart. Mount a PersistentVolume at this path for durable storage. |
+
+> **Health endpoints:** `GET /healthz` is the liveness probe (shallow, always 200 when the
+> HTTP server is alive). `GET /readyz` is the readiness probe (200 only when the SQLite store
+> is reachable). Kubernetes routes traffic only to pods whose `/readyz` returns 200.
 
 #### Ingestor Prometheus metrics (`:9091/metrics`)
 

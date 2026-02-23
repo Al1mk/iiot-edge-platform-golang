@@ -41,6 +41,7 @@ func newTestMux(t *testing.T) *http.ServeMux {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler)
+	mux.HandleFunc("GET /readyz", makeReadyzHandler(st))
 	mux.HandleFunc("POST /api/v1/telemetry", makeTelemetryHandler(0, st))
 	mux.HandleFunc("GET /api/v1/telemetry/last", makeLastHandler(st))
 	mux.HandleFunc("GET /api/v1/telemetry/recent", makeRecentHandler(st))
@@ -239,9 +240,11 @@ func TestRouteLabelStability(t *testing.T) {
 	t.Parallel()
 	cases := []struct{ path, want string }{
 		{"/healthz", "/healthz"},
+		{"/readyz", "/readyz"},
 		{"/api/v1/telemetry", "/api/v1/telemetry"},
 		{"/api/v1/telemetry/last", "/api/v1/telemetry/last"},
 		{"/api/v1/telemetry/recent", "/api/v1/telemetry/recent"},
+		{"/api/v1/telemetry/stats", "/api/v1/telemetry/stats"},
 		{"/unknown", "other"},
 		{"/api/v1/telemetry/123", "other"},
 	}
@@ -430,5 +433,52 @@ func TestStatsRouteNever404(t *testing.T) {
 	// Accept 200 (DB up) or 503 (DB unavailable); both mean the handler ran.
 	if w.Code != http.StatusOK && w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unexpected status %d; want 200 or 503", w.Code)
+	}
+}
+
+// TestReadyzWithDB verifies that GET /readyz returns 200 {"status":"ok"} when
+// a healthy in-memory SQLite store is wired into the mux.
+func TestReadyzWithDB(t *testing.T) {
+	t.Parallel()
+	mux := newTestMux(t)
+
+	w := httptest.NewRecorder()
+	r, _ := http.NewRequest(http.MethodGet, "/readyz", nil)
+	mux.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["status"] != "ok" {
+		t.Fatalf("want status=ok, got %q", body["status"])
+	}
+}
+
+// TestReadyzWithNilStore verifies that GET /readyz returns 503 {"status":"not ready"}
+// when no DB is configured (st == nil). A nil store means persistence is
+// unavailable; the pod must not receive traffic until a store is present.
+func TestReadyzWithNilStore(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /readyz", makeReadyzHandler(nil))
+
+	w := httptest.NewRecorder()
+	r, _ := http.NewRequest(http.MethodGet, "/readyz", nil)
+	mux.ServeHTTP(w, r)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503 when st==nil, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	var body map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["status"] != "not ready" {
+		t.Fatalf("want status=not ready, got %q", body["status"])
 	}
 }

@@ -129,6 +129,25 @@ func healthzHandler(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// makeReadyzHandler returns a readiness handler that reports 200 only when the
+// HTTP server is up AND the SQLite store is reachable (if one is configured).
+// Kubernetes should use /readyz as the readinessProbe path so that the pod is
+// removed from service while the DB is unavailable, not merely while it is
+// starting. /healthz remains a shallow liveness check (process alive).
+func makeReadyzHandler(st *store) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if st == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready"})
+			return
+		}
+		if err := st.ping(); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}
+}
+
 func makeTelemetryHandler(maxSkew time.Duration, st *store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Apply body limit before any reads.
@@ -301,6 +320,8 @@ func routeLabel(r *http.Request) string {
 	switch r.URL.Path {
 	case "/healthz":
 		return "/healthz"
+	case "/readyz":
+		return "/readyz"
 	case "/api/v1/telemetry":
 		return "/api/v1/telemetry"
 	case "/api/v1/telemetry/last":
@@ -407,6 +428,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthzHandler)
+	mux.HandleFunc("GET /readyz", makeReadyzHandler(st))
 	mux.HandleFunc("POST /api/v1/telemetry", makeTelemetryHandler(maxSkew, st))
 	mux.HandleFunc("GET /api/v1/telemetry/last", makeLastHandler(st))
 	mux.HandleFunc("GET /api/v1/telemetry/recent", makeRecentHandler(st))

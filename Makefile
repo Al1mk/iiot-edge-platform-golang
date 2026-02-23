@@ -326,11 +326,31 @@ k3d-e2e-db: k3d-guard-docker k3d-guard-kube
 	  exit 1; \
 	}; \
 	\
+	_wait_readyz() { \
+	  _i=0; \
+	  while [ "$$_i" -lt 60 ]; do \
+	    _body=$$(curl -sS --max-time 1 http://localhost:8080/readyz 2>/dev/null || true); \
+	    case "$$_body" in \
+	      *'"status":"ok"'*) echo "  readyz OK (try $$(( _i + 1 )))"; return 0 ;; \
+	    esac; \
+	    [ "$$(( _i % 10 ))" = "0" ] && echo "  waiting for readyz... ($${_i}/60)"; \
+	    _i=$$(( _i + 1 )); \
+	    sleep 0.2; \
+	  done; \
+	  echo "FAIL: readyz not ready after 60 tries"; \
+	  kubectl -n iiot get pods -o wide || true; \
+	  kubectl -n iiot get endpointslice -l kubernetes.io/service-name=ingestor || true; \
+	  kubectl -n iiot logs -l app.kubernetes.io/name=ingestor --tail=80 --prefix || true; \
+	  exit 1; \
+	}; \
+	\
 	echo "--- e2e-db: seed ClientIP affinity ---"; \
 	_wait_healthz; \
 	\
+	echo "--- e2e-db: wait for DB readiness ---"; \
+	_wait_readyz; \
+	\
 	echo "--- e2e-db: POST telemetry ---"; \
-	_wait_healthz; \
 	now=$$(date -u +"%Y-%m-%dT%H:%M:%SZ"); \
 	payload="{\"device_id\":\"e2e-db-test\",\"timestamp\":\"$${now}\",\"temperature_c\":19.0,\"pressure_hpa\":1015.0,\"humidity_pct\":60.0,\"status\":\"ok\"}"; \
 	http_code=$$(curl -s -o /tmp/e2e-db-post.out -w "%{http_code}" \
@@ -366,7 +386,7 @@ k3d-e2e-db: k3d-guard-docker k3d-guard-kube
 	echo "  iiot_db_up OK"; \
 	\
 	echo "--- e2e-db: GET /api/v1/telemetry/stats ---"; \
-	_wait_healthz; \
+	_wait_readyz; \
 	http_code=$$(curl -s -o /tmp/e2e-db-stats.out -w "%{http_code}" \
 	  "http://localhost:8080/api/v1/telemetry/stats"); \
 	body=$$(cat /tmp/e2e-db-stats.out); \
@@ -386,7 +406,7 @@ k3d-e2e-db-persist: k3d-guard-docker k3d-guard-kube
 	_wait_healthz() { \
 	  _tries=0; \
 	  while [ "$$_tries" -lt 60 ]; do \
-	    _out=$$(curl -sS --max-time 1 http://localhost:8080/healthz 2>&1) || true; \
+	    _out=$$(curl -sS --max-time 1 http://localhost:8080/healthz 2>/dev/null) || true; \
 	    case "$$_out" in \
 	      *'"status":"ok"'*) echo "  healthz OK (try $$(( _tries + 1 )))"; return 0 ;; \
 	    esac; \
@@ -395,6 +415,24 @@ k3d-e2e-db-persist: k3d-guard-docker k3d-guard-kube
 	    sleep 0.2; \
 	  done; \
 	  echo "FAIL: healthz did not return ok after 60 tries"; \
+	  kubectl -n iiot get pods -l app.kubernetes.io/name=ingestor -o wide; \
+	  kubectl -n iiot get endpointslice -l kubernetes.io/service-name=ingestor -o wide || true; \
+	  kubectl -n iiot logs -l app.kubernetes.io/name=ingestor --tail=80 --prefix || true; \
+	  exit 1; \
+	}; \
+	\
+	_wait_readyz() { \
+	  _i=0; \
+	  while [ "$$_i" -lt 60 ]; do \
+	    _body=$$(curl -sS --max-time 1 http://localhost:8080/readyz 2>/dev/null) || true; \
+	    case "$$_body" in \
+	      *'"status":"ok"'*) echo "  readyz OK (try $$(( _i + 1 )))"; return 0 ;; \
+	    esac; \
+	    [ "$$(( _i % 10 ))" = "0" ] && echo "  waiting for readyz... ($${_i}/60)"; \
+	    _i=$$(( _i + 1 )); \
+	    sleep 0.2; \
+	  done; \
+	  echo "FAIL: readyz not ready after 60 tries"; \
 	  kubectl -n iiot get pods -l app.kubernetes.io/name=ingestor -o wide; \
 	  kubectl -n iiot get endpointslice -l kubernetes.io/service-name=ingestor -o wide || true; \
 	  kubectl -n iiot logs -l app.kubernetes.io/name=ingestor --tail=80 --prefix || true; \
@@ -440,6 +478,9 @@ k3d-e2e-db-persist: k3d-guard-docker k3d-guard-kube
 	\
 	echo "--- e2e-db-persist: re-seed ClientIP affinity ---"; \
 	_wait_healthz; \
+	\
+	echo "--- e2e-db-persist: wait for DB readiness ---"; \
+	_wait_readyz; \
 	\
 	echo "--- e2e-db-persist: GET /last after restart ---"; \
 	http_code=$$(curl -s -o /tmp/e2e-db-persist-last2.out -w "%{http_code}" \
