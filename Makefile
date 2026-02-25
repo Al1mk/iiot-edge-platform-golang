@@ -16,6 +16,7 @@ KUSTOMIZE_BASE    := deploy/kustomize/base
 KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
 
 .PHONY: fmt lint test test-race build \
+        ci \
         docker-build \
         manifests-lint \
         k3d-guard-docker k3d-guard-kube \
@@ -27,6 +28,32 @@ KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
 # ---------------------------------------------------------------------------
 # Development
 # ---------------------------------------------------------------------------
+
+## ci: Run all CI checks (tidy, vet, test, build, manifests)
+ci:
+	@echo "--- ci: go mod tidy ---"
+	go mod tidy
+	@if ! git diff --exit-code go.mod go.sum > /dev/null 2>&1; then \
+	  echo "FAIL: go.mod or go.sum is not tidy. Run 'go mod tidy' and commit the changes."; \
+	  exit 1; \
+	fi
+	@echo "--- ci: go vet ---"
+	go vet ./...
+	@echo "--- ci: go test ---"
+	go test ./... -race -timeout 60s
+	@echo "--- ci: build ingestor ---"
+	CGO_ENABLED=0 go build ./cloud/ingestor
+	@echo "--- ci: build mqtt-bridge ---"
+	CGO_ENABLED=0 go build ./cloud/mqtt-bridge
+	@echo "--- ci: build collector ---"
+	CGO_ENABLED=0 go build ./edge/collector
+	@echo "--- ci: kubectl kustomize ---"
+	@if ! command -v kubectl > /dev/null 2>&1; then \
+	  echo "FAIL: kubectl is not installed or not in PATH. Install kubectl and retry."; \
+	  exit 1; \
+	fi
+	kubectl kustomize deploy/kustomize/overlays/local > /dev/null
+	@echo "CI OK"
 
 ## fmt: Format all Go source files
 fmt:
