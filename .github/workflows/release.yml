@@ -33,7 +33,8 @@ jobs:
       - name: Compute tags — ingestor
         id: tags-ingestor
         run: |
-          BASE="ghcr.io/${{ github.repository }}/ingestor"
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          BASE="ghcr.io/${REPO_LC}/ingestor"
           TAGS="${BASE}:${{ github.sha }}"
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VERSION="${{ github.ref_name }}"
@@ -44,7 +45,8 @@ jobs:
       - name: Compute tags — mqtt-bridge
         id: tags-bridge
         run: |
-          BASE="ghcr.io/${{ github.repository }}/mqtt-bridge"
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          BASE="ghcr.io/${REPO_LC}/mqtt-bridge"
           TAGS="${BASE}:${{ github.sha }}"
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VERSION="${{ github.ref_name }}"
