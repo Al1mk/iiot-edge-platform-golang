@@ -62,6 +62,18 @@ jobs:
           push: true
           tags: ${{ steps.tags-ingestor.outputs.tags }}
 
+      - name: Compute tags — collector
+        id: tags-collector
+        run: |
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          BASE="ghcr.io/${REPO_LC}/collector"
+          TAGS="${BASE}:${{ github.sha }}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${{ github.ref_name }}"
+            TAGS="${TAGS},${BASE}:${VERSION},${BASE}:latest"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push mqtt-bridge
         uses: docker/build-push-action@v6
         with:
@@ -69,3 +81,11 @@ jobs:
           file: cloud/mqtt-bridge/Dockerfile
           push: true
           tags: ${{ steps.tags-bridge.outputs.tags }}
+
+      - name: Build and push collector
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: edge/collector/Dockerfile
+          push: true
+          tags: ${{ steps.tags-collector.outputs.tags }}
