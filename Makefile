@@ -23,6 +23,7 @@ KUSTOMIZE_OVERLAY := deploy/kustomize/overlays/local
         k3d-cluster-up k3d-up k3d-down k3d-load k3d-deploy k3d-redeploy k3d-logs \
         k3d-metrics k3d-metrics-down k3d-smoke k3d-e2e k3d-e2e-db k3d-e2e-db-persist \
         compose-up compose-down \
+        demo tunnel-status \
         clean help
 
 # ---------------------------------------------------------------------------
@@ -527,6 +528,20 @@ k3d-logs:
 	kubectl -n iiot logs -f --prefix \
 	  -l app.kubernetes.io/part-of=iiot-edge-platform \
 	  --max-log-requests 10
+
+# ---------------------------------------------------------------------------
+# Demo — remote k3s cluster (IP-only, SSH tunnel)
+# ---------------------------------------------------------------------------
+
+## demo: Run the 30-second live demo against the remote k3s cluster.
+##   Requires: SSHPASS env var (SSH password) or key-based auth.
+##   What it does: starts SSH tunnel → sets KUBECONFIG → cluster snapshot → HTTP/HTTPS checks.
+demo:
+	@bash scripts/demo-30s.sh
+
+## tunnel-status: Check whether the SSH tunnel to the k3s API is running.
+tunnel-status:
+	@bash scripts/tunnel-up.sh --status
 
 # ---------------------------------------------------------------------------
 # Housekeeping
