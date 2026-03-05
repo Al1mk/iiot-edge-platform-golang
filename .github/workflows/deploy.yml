@@ -6,11 +6,11 @@ name: Deploy
 #
 # Required GitHub secret:
 #   KUBECONFIG_BASE64  — base64-encoded /etc/rancher/k3s/k3s.yaml with server URL
-#                        changed from 127.0.0.1 to 91.107.174.94 (public IP).
+#                        changed from 127.0.0.1 to <SERVER_IP> (public IP).
 #
 # To generate the secret value, run on the server:
 #   cat /etc/rancher/k3s/k3s.yaml \
-#     | sed 's|https://127.0.0.1:6443|https://91.107.174.94:6443|g' \
+#     | sed 's|https://127.0.0.1:6443|https://<SERVER_IP>:6443|g' \
 #     | base64 -w 0
 #
 # Then add it at:
