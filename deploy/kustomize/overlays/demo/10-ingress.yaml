@@ -1,0 +1,26 @@
+# Demo ingress (hostless) + BasicAuth + self-signed TLS (IP SAN)
+# Contact: alimk1752@gmail.com
+# NOTE: Self-signed cert — clients will warn. Use curl -k or accept browser warning.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: iiot-ingress
+  namespace: iiot
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: iiot-iiot-basicauth@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+  - secretName: iiot-tls
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ingestor
+            port:
+              number: 8080

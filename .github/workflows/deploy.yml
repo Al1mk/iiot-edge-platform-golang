@@ -1,0 +1,101 @@
+name: Deploy
+
+# Triggers after the release workflow publishes images to GHCR.
+# Runs on every v* tag — the same trigger as release.yml.
+# The release workflow builds and pushes images; this workflow deploys them to the k3s cluster.
+#
+# Required GitHub secret:
+#   KUBECONFIG_BASE64  — base64-encoded /etc/rancher/k3s/k3s.yaml with server URL
+#                        changed from 127.0.0.1 to <SERVER_IP> (public IP).
+#
+# To generate the secret value, run on the server:
+#   cat /etc/rancher/k3s/k3s.yaml \
+#     | sed 's|https://127.0.0.1:6443|https://<SERVER_IP>:6443|g' \
+#     | base64 -w 0
+#
+# Then add it at:
+#   GitHub repo → Settings → Secrets and variables → Actions → New repository secret
+#   Name: KUBECONFIG_BASE64
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false   # never cancel an in-flight deploy
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to k3s
+    environment:
+      name: production
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.28.0"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_BASE64 }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Verify cluster connectivity
+        run: kubectl cluster-info --request-timeout=10s
+
+      - name: Update image tags
+        run: |
+          VERSION="${{ github.ref_name }}"
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+
+          kubectl set image deployment/collector \
+            collector=ghcr.io/${REPO_LC}/collector:${VERSION} \
+            -n iiot
+
+          kubectl set image deployment/mqtt-bridge \
+            mqtt-bridge=ghcr.io/${REPO_LC}/mqtt-bridge:${VERSION} \
+            -n iiot
+
+          kubectl set image deployment/ingestor \
+            ingestor=ghcr.io/${REPO_LC}/ingestor:${VERSION} \
+            -n iiot
+
+      - name: Wait for rollouts
+        run: |
+          kubectl rollout status deployment/collector  -n iiot --timeout=120s
+          kubectl rollout status deployment/mqtt-bridge -n iiot --timeout=120s
+          # ingestor uses Recreate strategy — old pod terminates before new one starts
+          kubectl rollout status deployment/ingestor   -n iiot --timeout=180s
+
+      - name: Verify ingestor health
+        run: |
+          # Port-forward ingestor and probe /healthz and /readyz
+          kubectl port-forward -n iiot svc/ingestor 18080:8080 &
+          PF_PID=$!
+          sleep 3
+
+          HEALTH=$(curl -sf http://localhost:18080/healthz | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "")
+          READY=$(curl -sf http://localhost:18080/readyz  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "")
+
+          kill $PF_PID 2>/dev/null || true
+
+          echo "healthz: $HEALTH"
+          echo "readyz:  $READY"
+
+          [ "$HEALTH" = "ok" ] || { echo "ERROR: /healthz not ok"; exit 1; }
+          [ "$READY" = "ok" ]  || { echo "ERROR: /readyz not ok";  exit 1; }
+
+      - name: Print deployed versions
+        run: |
+          echo "=== Deployed image tags ==="
+          kubectl get deployment -n iiot -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}{end}'
