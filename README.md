@@ -72,33 +72,42 @@ Sensor readings flow from a simulated field device → MQTT broker → bridge �
 
 ## How to Demo in 30 Seconds
 
-### One-time setup (first run only)
+### Recommended: SSH key auth (no password typing)
+
+Copy your public key to the server once, then `make demo` just works:
 
 ```bash
-# 1. Install sshpass (macOS)
+# One-time: add your key to the server
+ssh-copy-id -p 22 root@<SERVER_IP>
+
+# Every run — no passwords needed
+make demo
+```
+
+The script prompts interactively for the **BasicAuth password** (the one that gates the
+app's HTTP endpoint). The script does not print it, store it, or pass it via environment.
+
+### Alternative: password-based SSH
+
+If key auth is not set up, the tunnel script falls back to a hidden interactive prompt.
+Install `sshpass` first (it's used only to feed the password to SSH — never printed):
+
+```bash
+# macOS
 brew install hudochenkov/sshpass/sshpass
 
-# 2. Set SSH password in env (never stored on disk)
-export SSHPASS='<password>'
-
-# 3. Run — this fetches kubeconfig automatically on first run
+# Then just run — you'll be prompted for SSH password, then BasicAuth password
 make demo
 ```
 
-### Every subsequent run
+### What the script does
 
-```bash
-export SSHPASS='<password>'
-make demo
-```
-
-The script will:
-1. Start an SSH tunnel to the k3s API (port 6443 is not public)
-2. Set `KUBECONFIG` to `~/.kube/kubeconfig-iiot` (your default config is untouched)
-3. Print nodes / pods / ingress / Traefik service
-4. Prompt for the BasicAuth password (read interactively, never stored)
-5. Run HTTP + HTTPS checks — expect `401` without auth, `200` with auth
-6. POST a live telemetry reading through the ingress
+1. Opens an SSH tunnel: `local 16443 → server 127.0.0.1:6443` (k3s API, not public)
+2. Sets `KUBECONFIG=~/.kube/kubeconfig-iiot` — your default `~/.kube/config` is untouched
+3. Prints a cluster snapshot: nodes, pods in `iiot`, ingress, Traefik service
+4. Prompts for the BasicAuth password (hidden input, `read -s`)
+5. Runs HTTP + HTTPS checks — expects `401` without auth, `200` with auth
+6. POSTs a live telemetry reading through the public ingress
 
 Expected output (no secrets shown):
 
@@ -106,7 +115,19 @@ Expected output (no secrets shown):
 ══════════════════════════════════════════════
   STEP 1 — SSH tunnel to k3s API
 ══════════════════════════════════════════════
-[tunnel-up] already running (pid 12345) — nothing to do
+[tunnel-up] trying key auth...
+[tunnel-up] tunnel ready (port 16443 open after 2 attempts)
+
+  [nodes]
+    NAME   STATUS   ROLES           AGE   VERSION
+    iiot   Ready    control-plane   2d    v1.34.4+k3s1
+
+  [pods — namespace: iiot]
+    NAME                        READY   STATUS    RESTARTS
+    collector-xxx               1/1     Running   0
+    ingestor-xxx                1/1     Running   0
+    mosquitto-xxx               1/1     Running   0
+    mqtt-bridge-xxx             1/1     Running   0
 
   [PASS] GET /healthz   no-auth  → HTTP 401
   [PASS] GET /healthz   auth     → HTTP 200
@@ -118,11 +139,20 @@ Expected output (no secrets shown):
 ══════════════════════════════════════════════
 ```
 
-To get the BasicAuth password (on the server only):
+### Getting the BasicAuth password
+
+The password lives on the server only, never in git. To read it:
 
 ```bash
 ssh root@<SERVER_IP> 'cat /opt/iiot/secrets/basic-auth-password.txt'
 ```
+
+> **Security note:** Passwords are never passed via environment variables or
+> command-line arguments — both are visible in `ps` output and shell history.
+> `tunnel-up.sh` uses `sshpass -f <tmpfile>` to feed the password via a file
+> descriptor that is deleted immediately after use. The BasicAuth password is
+> read with `read -s` (no echo) and lives only in a local shell variable for
+> the duration of the curl calls.
 
 ---
 
@@ -214,15 +244,20 @@ kubectl -n iiot set image deployment/ingestor \
 ### SSH tunnel is down
 
 ```bash
-# Restart it
-export SSHPASS='<password>'
-bash scripts/tunnel-up.sh
-
 # Check status
 bash scripts/tunnel-up.sh --status
 
-# Inspect tunnel logs
+# Restart (will prompt for SSH password if key auth is not configured)
+bash scripts/tunnel-up.sh
+
+# Inspect tunnel logs (no secrets — password is never logged)
 cat /tmp/iiot-tunnel.log
+```
+
+Set up key auth to avoid typing the SSH password every time:
+
+```bash
+ssh-copy-id -p 22 root@<SERVER_IP>
 ```
 
 ### Wrong kubectl context
@@ -289,6 +324,39 @@ curl http://localhost:8080/healthz  # → {"status":"ok"}
 ```
 
 See [docs/runbook.md](docs/runbook.md) for the full local workflow reference.
+
+---
+
+## Production Hardening Checklist
+
+This demo runs as `root` with password SSH enabled — acceptable for a short-lived
+demo server, but not for anything beyond that. Before treating this as production:
+
+**Server access**
+- [ ] Create a non-root service account: `useradd -m -s /bin/bash k8s-admin`
+- [ ] Copy SSH keys to the new account; disable `root` SSH login (`PermitRootLogin no`)
+- [ ] Disable SSH password authentication (`PasswordAuthentication no` in `sshd_config`)
+- [ ] Restrict SSH to specific source IPs if known (`AllowUsers k8s-admin@<your-ip>`)
+
+**Firewall**
+- [ ] Open only ports 80, 443 (Traefik) and 22 (SSH) to the internet — block everything else
+- [ ] Block port 6443 externally — the k3s API must never be publicly reachable
+- [ ] Use `ufw` or `nftables` with a default-deny inbound policy
+
+**Auth and secrets**
+- [ ] Replace BasicAuth with OIDC/OAuth2 (Traefik ForwardAuth + Keycloak, Dex, or GitHub OAuth)
+- [ ] Rotate the BasicAuth password and the self-signed TLS cert before any real use
+- [ ] Move secrets to an external manager (Vault, AWS Secrets Manager, External Secrets Operator)
+
+**TLS**
+- [ ] Acquire a domain, point DNS to the server IP
+- [ ] Install cert-manager with a Let's Encrypt ClusterIssuer
+- [ ] Enable HSTS (`Strict-Transport-Security: max-age=31536000; includeSubDomains`)
+
+**Observability**
+- [ ] Add Grafana + Alertmanager on top of the existing Prometheus metrics
+- [ ] Alert on `iiot_db_up == 0`, 5xx rate, and pod restart count
+- [ ] Ship logs to a central store (Loki, CloudWatch, Datadog)
 
 ---
 

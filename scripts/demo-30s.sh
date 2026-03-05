@@ -15,7 +15,7 @@
 # It is NEVER stored in this script, in env vars, or in any file visible to git.
 #
 # Prerequisites:
-#   - SSH access to the server (key auth recommended; or set SSHPASS env var)
+#   - SSH access to the server (key auth recommended; password prompt as fallback)
 #   - kubectl installed locally
 #   - The tunnel script (scripts/tunnel-up.sh) available
 
