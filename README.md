@@ -8,6 +8,23 @@ Sensor readings flow from a simulated field device → MQTT broker → bridge �
 
 ---
 
+## Why I Built This
+
+Most portfolio projects stop at "it runs locally." I wanted to build something that reflects
+what DevOps and SRE work actually looks like: a service that is deployed, secured, observable,
+and maintainable on real infrastructure.
+
+This project runs a four-service IIoT telemetry pipeline on a self-managed k3s cluster with
+Traefik ingress, BasicAuth, self-signed TLS, Prometheus metrics, SQLite persistence, and a
+tag-triggered CI/CD pipeline. Cluster access is tunnelled through SSH — port 6443 is never
+exposed. Operational runbooks, a maintenance guide, and a 30-second demo script are included
+because shipping software is only half the job.
+
+The goal was to demonstrate end-to-end thinking: from a `git tag` to a running pod, from a
+curl returning 401 to one returning 200, and from a growing WAL file to a checkpointed database.
+
+---
+
 ## Architecture
 
 ```
@@ -44,6 +61,43 @@ Sensor readings flow from a simulated field device → MQTT broker → bridge �
               │ Traefik Ingress│   │  Prometheus/Grafana│   │  SQLite on PVC  │
               │ BasicAuth + TLS│   │  (metrics exposed) │   │  (5Gi RWO)      │
               └────────────────┘   └──────────────────┘   └────────────────┘
+```
+
+### High-Level Architecture
+
+A four-service IIoT telemetry pipeline deployed on a single-node k3s cluster. Public
+traffic enters through Traefik with BasicAuth and self-signed TLS. The data path runs
+from a simulated edge collector through an MQTT broker to a REST ingestor that persists
+readings to SQLite. The Kubernetes API is never exposed publicly — cluster management
+requires an SSH tunnel.
+
+```mermaid
+flowchart TD
+    User(["User / Recruiter"])
+    Admin(["Admin / kubectl"])
+
+    subgraph VPS ["VPS — k3s cluster"]
+        Traefik["Traefik Ingress\nBasicAuth · TLS"]
+
+        subgraph iiot ["namespace: iiot"]
+            Collector["Collector\n(edge telemetry)"]
+            Mosquitto["Mosquitto\nMQTT Broker"]
+            Bridge["MQTT Bridge"]
+            Ingestor["Ingestor API\nPOST /api/v1/telemetry"]
+            SQLite[("SQLite")]
+        end
+
+        K3sAPI["k3s API Server\n:6443 internal only"]
+    end
+
+    User -->|"HTTPS · port 443"| Traefik
+    Traefik -->|"HTTP"| Ingestor
+    Collector -->|"MQTT :1883"| Mosquitto
+    Mosquitto -->|"subscribe"| Bridge
+    Bridge -->|"HTTP POST"| Ingestor
+    Ingestor -->|"persist"| SQLite
+
+    Admin -->|"SSH tunnel\nlocalhost:16443"| K3sAPI
 ```
 
 ### Components
