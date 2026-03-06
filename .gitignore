@@ -22,10 +22,12 @@ vendor/
 # Build artifacts
 dist/
 
-# Environment files
+# Environment files (secrets) — excluded by default
 .env
 .env.*
 *.env
+# Exception: demo.env contains only non-secret config (IP, port, username)
+!scripts/demo.env
 
 # macOS
 .DS_Store
